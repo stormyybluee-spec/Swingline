@@ -60,8 +60,24 @@ public struct CropRefinementConfig {
     public var minCropVisibility: Double = 0.5
     /// Crop landmarks further than this from the cleaned full-frame value
     /// (normalised image units / metres) are discarded as disagreements.
+    /// These gates apply when the full-frame sample is a MEASUREMENT.
     public var maxNormDelta: Double = 0.08
     public var maxWorldDelta: Double = 0.15
+    /// Below this full-frame visibility a sample is a fill (the cleanup's
+    /// holds sit at 0.12, its deep dims under 0.3), not a measurement, and
+    /// the trust hierarchy inverts: the crop detection is the only real
+    /// measurement in the comparison, so gating it against the fill was
+    /// backwards. See the merge note in refineFrame.
+    public var heldVisibilityBar: Double = 0.3
+    /// The wider acceptance radii for a crop measurement replacing a fill.
+    /// A hold drifts from the truth by construction (the body keeps
+    /// moving past the frozen point), so the honest gate is against how
+    /// far a wrist can plausibly sit from its own held position mid
+    /// swing, not against the measurement-grade radii above. Still
+    /// bounded: past these the crop likely found a phantom, and the
+    /// candidate wrist gate has already had its say.
+    public var maxNormDeltaHeld: Double = 0.20
+    public var maxWorldDeltaHeld: Double = 0.35
     /// Preference multiplier for the crop pass on the merged arm joints.
     public var armWeightBoost: Double = 1.5
     /// A candidate whose remapped wrist mid sits further than this from the
@@ -313,7 +329,29 @@ final class CropRefinementPass {
         let cropNorm = result.landmarks[candidate]
         let cropWorld = candidate < result.worldLandmarks.count ? result.worldLandmarks[candidate] : nil
 
-        // 5. Confidence-weighted merge, arm joints preferring the crop.
+        // 5. The merge. Two regimes, split by what the full-frame sample
+        //    actually is (skeleton overhaul):
+        //
+        //    MEASUREMENT (visibility at or above heldVisibilityBar): the
+        //    original confidence-weighted merge, tight disagreement gates,
+        //    arm joints preferring the crop. Two measurements arguing.
+        //
+        //    FILL (below the bar: the cleanup's holds at 0.12 and its
+        //    deep dims): the crop is the ONLY measurement present, and
+        //    the old code had the trust hierarchy inverted twice over.
+        //    It gated the crop against the fill, so a genuine
+        //    re-detection sitting more than maxNormDelta from the frozen
+        //    hold, which is exactly where a re-detection sits, was
+        //    discarded; and when a crop DID land within the gate it
+        //    raised the sample's visibility to the crop's, so a barely
+        //    moved hold walked out of this pass wearing a measurement's
+        //    visibility, which disarmed both rescue stages downstream
+        //    (the occlusion smoother's 0.3 floor and the grip anchor's
+        //    weak band) through the very P4 to P8 window this pass
+        //    covers. The fill regime now REPLACES the fill with the crop
+        //    measurement inside the wider held gates, and the written
+        //    visibility is the crop's own, which is now the honest
+        //    figure: the sample really was measured, by this pass.
         var merged = 0
         for j in Self.mergedJoints where j < timeline.jointCount && j < cropNorm.count {
             let lm = cropNorm[j]
@@ -326,39 +364,52 @@ final class CropRefinementPass {
             guard fx.isFinite, fy.isFinite,
                   timeline.norm.x[j][i].isFinite, timeline.norm.y[j][i].isFinite else { continue }
 
+            let rawFullVis = timeline.norm.visibility[j][i]
+            let isFill = rawFullVis.isFinite && rawFullVis < config.heldVisibilityBar
+            let normGate = isFill ? config.maxNormDeltaHeld : config.maxNormDelta
+            let worldGate = isFill ? config.maxWorldDeltaHeld : config.maxWorldDelta
+
             let dx = fx - timeline.norm.x[j][i]
             let dy = fy - timeline.norm.y[j][i]
-            guard (dx * dx + dy * dy).squareRoot() <= config.maxNormDelta else { continue }
+            guard (dx * dx + dy * dy).squareRoot() <= normGate else { continue }
 
-            let fullVis = timeline.norm.visibility[j][i].isFinite ? timeline.norm.visibility[j][i] : 0.5
-            let wCrop = cropVis * config.armWeightBoost
-            let w = wCrop / (wCrop + max(fullVis, 0.05))
+            let fullVis = rawFullVis.isFinite ? rawFullVis : 0.5
+            let w: Double
+            if isFill {
+                // The fill carries no positional information; the crop
+                // measurement replaces it outright.
+                w = 1
+            } else {
+                let wCrop = cropVis * config.armWeightBoost
+                w = wCrop / (wCrop + max(fullVis, 0.05))
+            }
 
             timeline.norm.x[j][i] += w * dx
             timeline.norm.y[j][i] += w * dy
-            timeline.norm.visibility[j][i] = max(fullVis, cropVis)
+            timeline.norm.visibility[j][i] = isFill ? cropVis : max(fullVis, cropVis)
 
-            // World, same weight, same joint, delta-capped. The crop box
-            // includes both hips, so the crop detection's hip-origin world
-            // space is real; a crop that lost the hips reports them at low
-            // visibility and its world deltas fail the cap.
+            // World, same weight, same joint, delta-capped with the same
+            // regime split. The crop box includes both hips, so the crop
+            // detection's hip-origin world space is real; a crop that
+            // lost the hips reports them at low visibility and its world
+            // deltas fail the cap.
             if let cw = cropWorld, j < cw.count,
                timeline.world.x[j][i].isFinite, timeline.world.y[j][i].isFinite {
                 let wx = Double(cw[j].x), wy = Double(cw[j].y), wz = Double(cw[j].z)
                 let wdx = wx - timeline.world.x[j][i]
                 let wdy = wy - timeline.world.y[j][i]
                 if wdx.isFinite, wdy.isFinite,
-                   (wdx * wdx + wdy * wdy).squareRoot() <= config.maxWorldDelta {
+                   (wdx * wdx + wdy * wdy).squareRoot() <= worldGate {
                     timeline.world.x[j][i] += w * wdx
                     timeline.world.y[j][i] += w * wdy
                     if timeline.world.z[j][i].isFinite, wz.isFinite,
-                       abs(wz - timeline.world.z[j][i]) <= config.maxWorldDelta {
+                       abs(wz - timeline.world.z[j][i]) <= worldGate {
                         timeline.world.z[j][i] += w * (wz - timeline.world.z[j][i])
                     }
-                    timeline.world.visibility[j][i] = max(
-                        timeline.world.visibility[j][i].isFinite ? timeline.world.visibility[j][i] : 0,
-                        cropVis
-                    )
+                    let oldWorldVis = timeline.world.visibility[j][i]
+                    timeline.world.visibility[j][i] = isFill
+                        ? cropVis
+                        : max(oldWorldVis.isFinite ? oldWorldVis : 0, cropVis)
                 }
             }
             merged += 1
@@ -399,31 +450,56 @@ final class CropRefinementPass {
         return rect
     }
 
-    /// The candidate detection whose remapped wrist midpoint is nearest the
-    /// full-frame golfer's wrist midpoint, within the acceptance radius.
-    /// Somebody else standing inside the crop cannot pass this test.
+    /// The candidate detection whose remapped wrists sit on the full-frame
+    /// golfer's wrists, within the acceptance radius. Somebody else
+    /// standing inside the crop cannot pass this test.
+    ///
+    /// Skeleton overhaul: the reference point is built from MEASURED
+    /// wrists only. The old midpoint took both wrists regardless, and
+    /// through the P4 to P8 window one of them is routinely a hold parked
+    /// on the hip, which dragged the reference half way to the wrong
+    /// place and could reject the true candidate through the very frames
+    /// this pass exists to rescue. A wrist now counts toward the
+    /// reference only when its visibility clears the held bar; when both
+    /// are fills, the frame keeps the midpoint of whatever is finite,
+    /// the best remaining guess.
     private func pickCandidate(
         result: PoseLandmarkerResult, box: CGRect, timeline: PoseTimeline, i: Int
     ) -> Int? {
         let lw = Landmarks.LEFT_WRIST, rw = Landmarks.RIGHT_WRIST
-        guard timeline.norm.x[lw][i].isFinite || timeline.norm.x[rw][i].isFinite else { return nil }
-        let fullX: Double
-        let fullY: Double
-        if timeline.norm.x[lw][i].isFinite, timeline.norm.x[rw][i].isFinite {
-            fullX = (timeline.norm.x[lw][i] + timeline.norm.x[rw][i]) / 2
-            fullY = (timeline.norm.y[lw][i] + timeline.norm.y[rw][i]) / 2
-        } else if timeline.norm.x[lw][i].isFinite {
-            fullX = timeline.norm.x[lw][i]; fullY = timeline.norm.y[lw][i]
-        } else {
-            fullX = timeline.norm.x[rw][i]; fullY = timeline.norm.y[rw][i]
+
+        func measured(_ j: Int) -> Bool {
+            guard timeline.norm.x[j][i].isFinite else { return false }
+            let v = timeline.norm.visibility[j][i]
+            return !(v.isFinite && v < config.heldVisibilityBar)
         }
+
+        let useL: Bool
+        let useR: Bool
+        if measured(lw) || measured(rw) {
+            useL = measured(lw)
+            useR = measured(rw)
+        } else {
+            useL = timeline.norm.x[lw][i].isFinite
+            useR = timeline.norm.x[rw][i].isFinite
+        }
+        guard useL || useR else { return nil }
+
+        var fullX = 0.0, fullY = 0.0, count = 0.0
+        if useL { fullX += timeline.norm.x[lw][i]; fullY += timeline.norm.y[lw][i]; count += 1 }
+        if useR { fullX += timeline.norm.x[rw][i]; fullY += timeline.norm.y[rw][i]; count += 1 }
+        fullX /= count; fullY /= count
 
         var best: Int? = nil
         var bestDist = config.maxCandidateWristDistance
         for (k, landmarks) in result.landmarks.enumerated() {
             guard landmarks.count > rw else { continue }
-            let cx = box.minX + (Double(landmarks[lw].x) + Double(landmarks[rw].x)) / 2 * box.width
-            let cy = box.minY + (Double(landmarks[lw].y) + Double(landmarks[rw].y)) / 2 * box.height
+            var cx = 0.0, cy = 0.0
+            if useL { cx += box.minX + Double(landmarks[lw].x) * box.width
+                      cy += box.minY + Double(landmarks[lw].y) * box.height }
+            if useR { cx += box.minX + Double(landmarks[rw].x) * box.width
+                      cy += box.minY + Double(landmarks[rw].y) * box.height }
+            cx /= count; cy /= count
             let d = ((cx - fullX) * (cx - fullX) + (cy - fullY) * (cy - fullY)).squareRoot()
             if d < bestDist {
                 bestDist = d

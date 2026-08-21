@@ -120,23 +120,42 @@
 //    weak wrist is drawn back to grip distance from the trusted one.
 //    Counted in qc.gripClusterFrames.
 //
-//  ORDER OF OPERATIONS (conflict C3 from the roadmap)
+//  ORDER OF OPERATIONS (conflict C3, amended by the skeleton overhaul)
 //
-//    1. bone-length projection        world space, pose-invariant lengths
-//    1a. shoulder projection          both spaces, occluded shoulder only
-//                                     (Fix S, now with the medial collapse
-//                                     guard), before the torso stage so
-//                                     symmetric width scaling never splits
-//                                     an occlusion error with the good side
-//    1b. torso width and ratio        world widths, both-space ratios (Fix 1)
+//    0. view profile                  clip-level DTL versus face-on
+//                                     classification routes per-view
+//                                     thresholds through one pipeline
+//    1. shoulder projection           FIRST, world-space rigid-body reseat
+//                                     (Fix S rebuilt, collapse guard on
+//                                     pose-invariant width and radius).
+//                                     Before the bones on purpose: the
+//                                     bone stage restores length by moving
+//                                     the DISTAL joint, so running it
+//                                     against a collapsed shoulder used to
+//                                     drag the elbow inward and the wrist
+//                                     after it, manufacturing the stump
+//                                     and the cross-link downstream of one
+//                                     bad joint
+//    1b. torso width and ratio        world widths, both-space ratios
+//                                     (Fix 1), after the reseat so its
+//                                     symmetric scaling never splits a
+//                                     collapse error with the good side
+//    1c. bone-length projection       world space, pose-invariant lengths,
+//                                     proximal to distal from corrected
+//                                     roots
 //    2. impossible-fold relaxation    world space
 //    2b. ground plane                 both spaces, feet only (Fix 4,
-//                                     extended: depth flattening and the
-//                                     ankle anchor)
-//    2c. grip cluster anchor          both spaces, weak wrist only (Fix G),
-//                                     before the hand collapse guard so the
-//                                     palm is restored against a wrist that
-//                                     is already back on the club
+//                                     extended: the up-sign inversion is
+//                                     FIXED, depth flattening now restores
+//                                     the rigid foot length, the ankle
+//                                     anchor is floored above the turf)
+//    2c. grip cluster anchor          both spaces, weak wrist only (Fix G
+//                                     rebuilt: wider weak band, weakness
+//                                     scaled pull, forearm-axis target,
+//                                     edge ramps), before the hand
+//                                     collapse guard so the palm is
+//                                     restored against a wrist that is
+//                                     already back on the club
 //    3. hand collapse guard           both spaces, both hands. The Gemini
 //                                     audit of Video 1: at impact, with the
 //                                     hands past 4 m/s, MediaPipe collapses
@@ -148,6 +167,14 @@
 //                                     clip-median separation along the
 //                                     measured forearm direction.
 //    5. GMM prior (Task 5)            norm space, mirrored to world, optional
+//    6. ground backstop               penetration clamps only, idempotent,
+//                                     run()'s own last word. UploadProcessor
+//                                     SHOULD call enforceGroundBackstop once
+//                                     more AFTER AdaptiveSmoothing: a zero
+//                                     phase Butterworth can undershoot the
+//                                     hard corner a clamp writes, which is
+//                                     the residual below-turf ankle on an
+//                                     otherwise corrected clip
 //
 //  Grip fusion (once step 6, "LAST, per conflict C3") is REMOVED. Both
 //  wrists are now carried and drawn separately, so the corrector's last act
@@ -190,6 +217,37 @@ enum SwingViewClassifier {
         let planar = (dx * dx + dy * dy).squareRoot()
         guard planar > 1e-6 else { return .faceOn }
         return abs(zl - zr) > 0.6 * planar ? .downTheLine : .faceOn
+    }
+
+    /*
+      Clip-level classification, for routing the corrector's DTL and face-on
+      profiles. The per-frame rule above votes on every frame where both
+      shoulders were confidently seen and carried depth; the majority wins.
+      Address and finish dominate a clip's frame count, and those are the
+      windows where the camera angle reads cleanest, so a simple majority is
+      robust to the rotation sweeping the instantaneous ratio through both
+      regimes mid swing. Defaults to face-on when depth never showed up,
+      which leaves every threshold at its milder setting, the safe side.
+    */
+    static func classifyClip(_ timeline: PoseTimeline, minVisibility: Double = 0.6) -> SwingView {
+        let ls = Landmarks.LEFT_SHOULDER, rs = Landmarks.RIGHT_SHOULDER
+        guard max(ls, rs) < timeline.jointCount else { return .faceOn }
+        var dtl = 0, face = 0
+        for i in 0..<timeline.frameCount {
+            let lx = timeline.norm.x[ls][i], ly = timeline.norm.y[ls][i]
+            let rx = timeline.norm.x[rs][i], ry = timeline.norm.y[rs][i]
+            let lz = timeline.norm.z[ls][i], rz = timeline.norm.z[rs][i]
+            let lv = timeline.norm.visibility[ls][i]
+            let rv = timeline.norm.visibility[rs][i]
+            guard lx.isFinite, rx.isFinite, lz.isFinite, rz.isFinite,
+                  !(lv.isFinite && lv < minVisibility),
+                  !(rv.isFinite && rv < minVisibility) else { continue }
+            let dx = lx - rx, dy = ly - ry
+            let planar = (dx * dx + dy * dy).squareRoot()
+            guard planar > 1e-6 else { continue }
+            if abs(lz - rz) > 0.6 * planar { dtl += 1 } else { face += 1 }
+        }
+        return dtl > face ? .downTheLine : .faceOn
     }
 }
 
@@ -268,7 +326,32 @@ public struct ShoulderProjectionConfig {
     /// A shoulder to hip width ratio below this fraction of the clip
     /// median marks the frame as a one sided collapse. Honest DTL
     /// foreshortening shrinks both widths together and never gets near it.
+    ///
+    /// RETIRED AS THE PRIMARY DETECTOR by the skeleton overhaul: the
+    /// premise is wrong for a golf swing. Shoulders rotate roughly twice
+    /// as far as hips (the X factor, this app's own metric), so the
+    /// PROJECTED shoulder to hip ratio legitimately sweeps through a wide
+    /// range across the swing. Down the line the ratio at the top sits far
+    /// ABOVE the clip median (the shoulder line swings broadside to the
+    /// camera), which is exactly where the collapse happens, so a genuine
+    /// collapse there almost never crossed 0.55 of the median and the
+    /// guard sat silent through the worst frames. The field stays so a
+    /// tuned config still decodes; the detectors that replaced it are the
+    /// two below, both built on pose-invariant quantities.
     public var collapseRatioFraction: Double = 0.55
+    /// WORLD-SPACE WIDTH CRUSH, the primary detector. Metric shoulder
+    /// width (11 to 12, 3D) is a body constant no rotation can change, so
+    /// a frame whose world width falls under this fraction of the clip
+    /// median is a collapse by definition, at any phase, from any camera.
+    public var collapseWidthFraction: Double = 0.72
+    /// NECK PROXIMITY, the image-space emergency detector (the brief's
+    /// "within 10 pixels of the neck"): a frame whose PLANAR normalised
+    /// shoulder separation falls under this fraction of its own clip
+    /// median is the on-screen "V at the neck" directly. In norm space a
+    /// real DTL rotation can shrink the planar separation honestly, so
+    /// this bar sits low and only catches the near-coincident cases the
+    /// world test might miss when world data is degraded.
+    public var neckProximityWidthFraction: Double = 0.35
     /// The convicted shoulder's implication error must exceed the other
     /// side's by at least this factor, so a frame where both sides look
     /// wrong (a genuinely bad frame) convicts nobody and the other stages
@@ -321,29 +404,60 @@ public struct ShoulderProjectionConfig {
 */
 public struct GripClusterConfig {
     public var enabled: Bool = true
-    /// The anchor wrist must clear this visibility for the stage to fire
-    /// (the occlusion overhaul's trusted bar).
+    /// Frames where BOTH wrists clear this bar feed the clip's confident
+    /// grip separation median. Statistics only; the firing bars are the
+    /// two below.
     public var trustedMinVisibility: Double = 0.6
-    /// Only a wrist at or below this visibility can be moved. Held samples
-    /// sit at the cleanup's 0.12 and confident measurements sit above the
-    /// rejection bar, so this bound covers fills and deeply dimmed samples
-    /// while a confidently measured wrist stays untouchable. On the Vision
-    /// backend no visibility is reported, nothing ever reads weak, and the
-    /// stage is inert, the honest behaviour.
-    public var weakMaxVisibility: Double = 0.3
+    /// The anchor wrist must clear this bar for the stage to fire. Sits
+    /// under the trusted bar on purpose (the audits' finding): through
+    /// the very windows where one wrist is held, the OTHER often reads
+    /// 0.5 to 0.6, still a real measurement, and demanding 0.6 of it
+    /// left the whole stage dead exactly when it was needed.
+    public var anchorMinVisibility: Double = 0.5
+    /// Only a wrist strictly below this visibility can be moved, and the
+    /// pull scales with how far below it sits (a deep hold takes the full
+    /// blend, a mid-trust bridge a fraction). WIDENED from 0.3 by the
+    /// skeleton overhaul: the cleanup's short-gap PCHIP bridges inherit
+    /// the weaker neighbour's visibility times 0.95, which lands well
+    /// ABOVE 0.3, so bridged wrists drifting off the club were invisible
+    /// to the old bound. Everything under the anchor bar is now in reach,
+    /// weighted by its own weakness. Confidently measured wrists remain
+    /// untouchable, and on the Vision backend (no visibility) nothing
+    /// ever reads weak and the stage stays inert, the honest behaviour.
+    public var weakMaxVisibility: Double = 0.45
     /// Separation past this multiple of the clip's own confident grip
-    /// separation triggers the pull, so the natural stagger of the two
-    /// hands on the handle, and its jitter, never fire it.
-    public var separationTriggerFactor: Double = 1.75
+    /// separation triggers the pull. LOWERED from 1.75 by the skeleton
+    /// overhaul: under the old factor a held wrist floated detached by
+    /// up to three quarters of a grip width before anything fired, which
+    /// is most of the on-screen "hovering in space". The natural stagger
+    /// of two hands on the handle sits well inside 1.35, and the DTL
+    /// profile tightens this further.
+    public var separationTriggerFactor: Double = 1.35
     /// Trigger floor and separation target when the clip never produced a
     /// confident grip median of its own, as a fraction of the clip-median
     /// forearm: two gripped wrists sit well inside half a forearm.
     public var fallbackSeparationForearmFraction: Double = 0.45
     /// Fraction of the way the weak wrist moves toward the implied grip
-    /// distance. Firmer than the shoulder projection's soft 0.5 because
-    /// the sample being moved is a hold or a bridge, not a measurement,
-    /// and carries no residual signal worth splitting the correction with.
+    /// distance, at full weakness. Firmer than the shoulder projection's
+    /// soft 0.5 because a hold is not a measurement and carries no
+    /// residual signal worth splitting the correction with.
     public var blend: Double = 0.85
+    /// Aim the pull along the anchor side's own forearm axis (elbow to
+    /// wrist) when that elbow can vouch for itself: the club hangs off
+    /// that axis at the grip, so the second hand sits along it, and the
+    /// held wrist's own stale bearing (the old target) could park the
+    /// hand at grip DISTANCE but on the wrong side of the handle. The
+    /// axis is signed toward the weak wrist's current side so the pull
+    /// never crosses the hand over the grip. Falls back to the stale
+    /// bearing when the elbow is dim.
+    public var forearmDirectionTarget: Bool = true
+    /// The pull fades in over this many frames at the start of each
+    /// corrected run, so the anchor engaging is a glide rather than the
+    /// audits' step. No fade at the run's END on purpose: a run usually
+    /// ends because the wrist was re-measured near the club, and the
+    /// last held frames should sit as close to that truth as the pull
+    /// can put them, which is what makes the re-acquisition seamless.
+    public var edgeRampFrames: Int = 3
 
     public init() {}
 }
@@ -493,6 +607,25 @@ public struct GroundPlaneConfig {
     /// than the heel and toe snap: the ankle carries the shin, and an
     /// aggressive pull there would kick visibly up the leg.
     public var ankleSnapBlend: Double = 0.5
+    /// The ankle joint's minimum anatomical height above the sole, as a
+    /// shin fraction (the malleolus sits roughly a tenth of a shin up).
+    /// The ankle's resting level is never taken below turf plus this, so
+    /// a clip whose measured ankle level came out underground (noise
+    /// stacked on noise) gets a floored anchor instead of no anchor: the
+    /// previous nil fallback handed the ankle to the bare turf clamp,
+    /// which could legally park the ankle ON the ground, a flattened
+    /// foot by construction.
+    public var minAnkleHeightShinFraction: Double = 0.10
+    /// Occlusion overhaul amendment: after flattening each foot joint's
+    /// depth to its clip median, restore the clip-median 3D heel-to-toe
+    /// length by spreading the two constant depths about the ankle's.
+    /// Per-joint medians of a noisy depth channel can land nearly on top
+    /// of each other down the line (where the foot points along the
+    /// optical axis and the planar separation is small too), and three
+    /// coincident constants is exactly the "three vertical joints" stack
+    /// the audits show. The restore keeps depth constant per joint, so
+    /// no per-frame depth noise returns; only the constants move apart.
+    public var restoreFootLengthAfterFlatten: Bool = true
 
     public init() {}
 }
@@ -739,9 +872,20 @@ public final class PosePriorCorrector {
         public init() {}
     }
 
-    private let config: Config
+    /// The caller's config, untouched, so profiles always derive from the
+    /// same base and never compound across runs.
+    private let baseConfig: Config
+    /// The config actually read by the stages: the base, tuned by the
+    /// detected view's profile at the top of run().
+    private var config: Config
     private let sides: Sides
     private let gmm: GMMPosePrior?
+
+    /// The clip-level view the last run() classified, for logging and for
+    /// any caller that wants to know which profile was applied. Nil until
+    /// run() has executed once. Internal, matching SwingView's own access
+    /// level.
+    private(set) var detectedView: SwingView?
 
     /*
       The lead wrist's normalised track, aligned to the timeline grid, NaN
@@ -756,6 +900,7 @@ public final class PosePriorCorrector {
     public private(set) var leadHandPathNormY: [Double] = []
 
     public init(config: Config = Config(), dominantHand: DominantHand, gmm: GMMPosePrior?) {
+        self.baseConfig = config
         self.config = config
         self.sides = Landmarks.sides(dominantHand)
         self.gmm = gmm
@@ -770,22 +915,49 @@ public final class PosePriorCorrector {
 
     public func run(_ timeline: inout PoseTimeline, qc: inout TrackingQC) {
         guard timeline.frameCount > 2 else { return }
-        projectBoneLengths(&timeline, qc: &qc)
-        projectOccludedShoulders(&timeline, qc: &qc)    // Fix S, BEFORE the torso
-                                                        // stage so its symmetric
-                                                        // scaling never splits an
-                                                        // occlusion error with
+
+        // Route the view profile first (the research brief's "separate DTL
+        // and face-on tracking"): the same stages run in both views, but
+        // each view's known failure modes get its own thresholds. The
+        // classification is clip-level and internal, so UploadProcessor's
+        // wiring is unchanged.
+        let view = SwingViewClassifier.classifyClip(timeline)
+        detectedView = view
+        config = Self.profiled(baseConfig, for: view)
+
+        projectOccludedShoulders(&timeline, qc: &qc)    // Fix S rebuilt. FIRST,
+                                                        // before the bones: the
+                                                        // bone stage restores
+                                                        // length by moving the
+                                                        // DISTAL joint, so a
+                                                        // collapsed shoulder
+                                                        // used to drag the
+                                                        // elbow, then the
+                                                        // wrist, after it. The
+                                                        // arm chain must hang
+                                                        // from a correct root.
+        enforceBiomechanicalRatios(&timeline, qc: &qc)  // Fix 1, after the reseat
+                                                        // so symmetric scaling
+                                                        // never splits a
+                                                        // collapse error with
                                                         // the good shoulder
-        enforceBiomechanicalRatios(&timeline, qc: &qc)  // Fix 1, after the bones
+        projectBoneLengths(&timeline, qc: &qc)          // proximal to distal,
+                                                        // from the corrected
+                                                        // shoulders and hips
         relaxImpossibleFolds(&timeline, qc: &qc)
         applyGroundConstraints(&timeline, qc: &qc)      // Fix 4 extended, feet only
-        anchorGripCluster(&timeline, qc: &qc)           // Fix G, before the palm
-                                                        // guard so the palm is
-                                                        // restored against a
-                                                        // wrist already back on
-                                                        // the club
+        anchorGripCluster(&timeline, qc: &qc)           // Fix G rebuilt, before
+                                                        // the palm guard so the
+                                                        // palm is restored
+                                                        // against a wrist
+                                                        // already back on the
+                                                        // club
         enforceHandSeparation(&timeline, qc: &qc)       // Video 1 fix
         gmm?.run(&timeline, qc: &qc)                    // TASK 5, when a model ships
+        enforceGroundBackstop(&timeline, qc: &qc)       // turf is not negotiable:
+                                                        // nothing the later
+                                                        // stages did may leave
+                                                        // a foot underground
 
         // The hand path anchor: the corrected lead wrist. With grip fusion
         // removed there is no fusion step after this, so the wrist stays the
@@ -801,6 +973,118 @@ public final class PosePriorCorrector {
             leadHandPathNormX = []
             leadHandPathNormY = []
         }
+    }
+
+    // MARK: - View profiles (DTL versus face-on)
+
+    /*
+      One pipeline, two tunings. Each camera angle has its own dominant
+      failure: down the line it is the trail-side occlusions (the crossing
+      wrist, the collapsing trail shoulder), so the DTL profile arms the
+      wrist anchor and the collapse guard harder; face on the hands occlude
+      each other around impact but the shoulders stay honest, so the
+      face-on profile keeps the collapse guard conservative and the wrist
+      anchor a touch looser, and never fights geometry it can trust. The
+      knobs touched here are deliberately few: a profile is a bias, not a
+      second pipeline, so a mis-classified clip degrades gracefully.
+    */
+    private static func profiled(_ base: Config, for view: SwingView) -> Config {
+        var c = base
+        switch view {
+        case .downTheLine:
+            // The crossing wrist detaches earlier and further here: fire
+            // the anchor sooner and pull firmer.
+            c.gripCluster.separationTriggerFactor = Swift.min(c.gripCluster.separationTriggerFactor, 1.2)
+            c.gripCluster.blend = Swift.max(c.gripCluster.blend, 0.9)
+            // The trail shoulder collapse lives in this view: convict on a
+            // smaller world-width crush.
+            c.shoulder.collapseWidthFraction = Swift.max(c.shoulder.collapseWidthFraction, 0.78)
+            // Foot depth is at its noisiest with the feet pointing along
+            // the optical axis; the flattening stays firmly on.
+            c.ground.flattenFootDepth = true
+        case .faceOn:
+            // Shoulders are broadside and honest: demand a harder crush
+            // before convicting, so a big honest turn is never touched.
+            c.shoulder.collapseWidthFraction = Swift.min(c.shoulder.collapseWidthFraction, 0.68)
+            // The hands overlap around impact but re-acquire fast; a
+            // slightly looser trigger avoids fighting the natural stagger.
+            c.gripCluster.separationTriggerFactor = Swift.max(c.gripCluster.separationTriggerFactor, 1.3)
+        }
+        return c
+    }
+
+    // MARK: - Ground backstop
+
+    /*
+      The penetration clamps alone, re-runnable and idempotent.
+
+      Two callers, one reason. run() calls it as its own last step, so no
+      stage inside the corrector (a fold relaxation, a GMM pull) can leave
+      a foot underground. UploadProcessor SHOULD ALSO call it once more
+      AFTER AdaptiveSmoothing: a zero-phase Butterworth is not a convex
+      combination, and filtering the hard corner a clamp writes can
+      undershoot a few millimetres past it, which is exactly the residual
+      below-turf ankle the audits kept finding on an otherwise corrected
+      clip. The stage is cheap (one pass over six joints), touches nothing
+      above the tolerance, and counts what it clamps into the same QC
+      fields as the main stage, so a clip where the backstop worked says
+      so.
+    */
+    public func enforceGroundBackstop(_ timeline: inout PoseTimeline, qc: inout TrackingQC) {
+        let c = config.ground
+        guard c.enabled, timeline.frameCount > 8 else { return }
+
+        var penetrations = 0
+        var ankleAnchors = 0
+
+        for space in [PoseSpace.norm, PoseSpace.world] {
+            var bank = timeline.channels(space)
+            guard let plane = estimateGroundPlane(bank, frameCount: timeline.frameCount, jointCount: timeline.jointCount) else { continue }
+            let penetrationBar = c.penetrationToleranceShinFraction * plane.shin
+            let minAnkleHeight = c.minAnkleHeightShinFraction * plane.shin
+
+            let footSides: [(heel: Int, toe: Int, ankle: Int, level: Double, ankleLevel: Double?)] = [
+                (Landmarks.LEFT_HEEL, Landmarks.LEFT_FOOT_INDEX, Landmarks.LEFT_ANKLE,
+                 plane.leftLevel, plane.leftAnkleLevel),
+                (Landmarks.RIGHT_HEEL, Landmarks.RIGHT_FOOT_INDEX, Landmarks.RIGHT_ANKLE,
+                 plane.rightLevel, plane.rightAnkleLevel),
+            ]
+
+            for side in footSides {
+                // The ankle's floor: its own measured level, never below
+                // the turf plus the joint's real height above the sole.
+                // A y at height h above the turf satisfies
+                // (level - y) * up = h, so y = level - up * h.
+                let ankleFloor: Double = {
+                    let lifted = side.level - plane.up * minAnkleHeight
+                    guard let own = side.ankleLevel else { return lifted }
+                    let ownHeight = (side.level - own) * plane.up
+                    return ownHeight >= minAnkleHeight ? own : lifted
+                }()
+
+                for i in 0..<timeline.frameCount {
+                    for j in [side.heel, side.toe] {
+                        guard bank.y[j][i].isFinite else { continue }
+                        let h = (side.level - bank.y[j][i]) * plane.up
+                        if h < -penetrationBar {
+                            bank.y[j][i] = side.level
+                            penetrations += 1
+                        }
+                    }
+                    if bank.y[side.ankle][i].isFinite {
+                        let h = (ankleFloor - bank.y[side.ankle][i]) * plane.up
+                        if h < -penetrationBar {
+                            bank.y[side.ankle][i] = ankleFloor
+                            ankleAnchors += 1
+                        }
+                    }
+                }
+            }
+            timeline.setChannels(space, bank)
+        }
+
+        qc.groundPenetrationsClamped += penetrations
+        qc.ankleGroundAnchors += ankleAnchors
     }
 
     // MARK: - Bone-length projection
@@ -873,41 +1157,56 @@ public final class PosePriorCorrector {
         qc.priorBoneCorrections += correctedFrames.count
     }
 
-    // MARK: - Shoulder occlusion projection (Fix S)
+    // MARK: - Shoulder occlusion projection (Fix S, rebuilt)
 
     /*
-      See ShoulderProjectionConfig for the model and its reasoning. Per
-      space, per shoulder, in that space's own image-plane geometry:
+      REBUILT by the skeleton overhaul. The previous stage detected and
+      corrected in each space's IMAGE PLANE, with a rigid model (radius from
+      the hip centre plus a fixed angular offset from the other shoulder)
+      that its own comment admitted was "exact for in-plane rotation and
+      approximate under foreshortening". A golf swing is out-of-plane
+      rotation almost end to end relative to any single camera, so at the
+      top and the finish, exactly where the trail shoulder collapses, the
+      implied position was systematically wrong, and the ratio gate in
+      front of it (see the config note on collapseRatioFraction) rarely
+      fired there at all. The result on screen was the audited failure
+      surviving every round: the shoulder snapped onto the neck while both
+      the bar and the guard looked elsewhere.
 
-        1. Learn the rigid torso from confident frames: for each shoulder,
-           the median radius from the hip centre and the circular-median
-           angular offset from the hip-to-other-shoulder direction. Both
-           shoulders' models are learned up front so the collapse guard
-           can compare the two sides before any projection runs. A
-           collapsed frame with confident visibility does feed the learning
-           pool, and that is tolerated on purpose: collapses cluster in
-           the top and finish windows, medians shrug off a minority, and
-           excluding them would need the very model being learned.
-        1b. Convict medial collapses (the skeleton integrity pass). On a
-           frame whose shoulder to hip width ratio has spiked one sidedly
-           under the collapse fraction of its clip median, blame the
-           shoulder whose position disagrees more with its rigid torso
-           implication, provided the disagreement dominates the other
-           side's and clears the noise floor.
-        2. On a frame where one shoulder sits under the occlusion bar, OR
-           stands convicted by the collapse guard, while the other
-           shoulder and both hips clear the anchor bar, place that
-           shoulder at the learned radius and offset from the visible
-           shoulder's measured direction: blended halfway there on the
-           visibility path, and at the firmer collapse blend on a
-           conviction, where the tracker's confident guess carries no
-           signal worth splitting with.
+      The rebuilt stage works from two quantities no rotation can change:
 
-      Depth is never touched. Frames are counted once into
-      qc.shoulderProjectionFrames however many spaces or shoulders fired,
-      matching how the bone projection counts; convicted frames are
-      counted again, separately, into qc.shoulderCollapseFrames so a clip
-      where the guard did the work says so.
+        WORLD SHOULDER WIDTH. |leftShoulder - rightShoulder| in metric 3D
+        is a body constant. Its clip median is this golfer's true width;
+        a frame far under it is a collapse at any phase, from any camera.
+
+        WORLD SHOULDER RADIUS. |shoulder - hipCentre| in metric 3D is
+        likewise (near) constant through a swing. Whichever side's radius
+        has shrunk the most below its own clip median is the side that
+        moved inward, which names the collapsed shoulder without reading
+        a single visibility value.
+
+      Correction is a rigid-body reseat in world 3D: the convicted (or
+      occluded) shoulder is placed on the intersection of the two spheres
+      those medians define (radius R about the hip centre, width W about
+      the good shoulder), at the point on that circle NEAREST its measured
+      position, so every scrap of honest signal in the measurement is
+      kept and only the impossible part is corrected. The move is blended
+      (soft for a mere occlusion, firm for a conviction), then mirrored
+      into the normalised set scaled by this frame's own hip width in
+      each space, so the drawn overlay and the 3D figure move together.
+      The world z DOES move here, deliberately: both constraints are 3D
+      facts, and it was precisely the depth error MediaPipe's inward
+      guess carries that the old image-plane rule left standing.
+
+      ORDER: this stage now runs FIRST in the corrector, before the bone
+      projection. The bone stage slides each DISTAL joint along the
+      measured direction to restore length, so running it against a
+      collapsed shoulder used to drag the elbow in after the shoulder and
+      the wrist in after the elbow: the "foreshortened stump" and the
+      diagonal cross-link were manufactured downstream of the one bad
+      joint. Reseating the shoulder first lets the whole arm chain hang
+      from a correct root, which is the kinematic-chain-integrity form
+      the research brief asks for.
     */
     private func projectOccludedShoulders(_ timeline: inout PoseTimeline, qc: inout TrackingQC) {
         let c = config.shoulder
@@ -921,172 +1220,227 @@ public final class PosePriorCorrector {
         var correctedFrames = Set<Int>()
         var collapseFrames = Set<Int>()
 
-        /// One learned rigid-torso relation per shoulder: its median radius
-        /// from the hip centre and its circular-median angular offset from
-        /// the other shoulder's direction, in one space's own geometry.
-        struct TorsoModel { var radius: Double; var delta: Double }
+        // Best-available per-sample visibility, norm preferred, the house
+        // convention everywhere trust is read. NaN (the Vision backend)
+        // reads as trusted, so the stage is inert there, the honest
+        // behaviour.
+        func vis(_ j: Int, _ i: Int) -> Double {
+            let v = timeline.norm.visibility[j][i]
+            if v.isFinite { return v }
+            let w = timeline.world.visibility[j][i]
+            return w.isFinite ? w : 1
+        }
 
-        for space in [PoseSpace.norm, PoseSpace.world] {
-            var bank = timeline.channels(space)
+        // ---- World-space geometry helpers (3D, z folded in when finite) --
 
-            // House convention: NaN visibility means the backend reported
-            // none, which reads as trusted, so the stage is inert on the
-            // Vision backend.
-            func vis(_ j: Int, _ i: Int) -> Double {
-                let v = bank.visibility[j][i]
-                return v.isFinite ? v : 1
-            }
-            func finite2(_ j: Int, _ i: Int) -> Bool {
-                bank.x[j][i].isFinite && bank.y[j][i].isFinite
-            }
-            func hipCentre(_ i: Int) -> (x: Double, y: Double)? {
-                guard finite2(lh, i), finite2(rh, i) else { return nil }
-                return ((bank.x[lh][i] + bank.x[rh][i]) / 2,
-                        (bank.y[lh][i] + bank.y[rh][i]) / 2)
-            }
-            func planarDist(_ a: Int, _ b: Int, _ i: Int) -> Double? {
-                guard finite2(a, i), finite2(b, i) else { return nil }
-                let dx = bank.x[a][i] - bank.x[b][i]
-                let dy = bank.y[a][i] - bank.y[b][i]
-                let d = (dx * dx + dy * dy).squareRoot()
-                return d > 1e-6 ? d : nil
-            }
+        func w3(_ j: Int, _ i: Int) -> Vec3? {
+            let x = timeline.world.x[j][i], y = timeline.world.y[j][i]
+            guard x.isFinite, y.isFinite else { return nil }
+            let z = timeline.world.z[j][i]
+            return Vec3(x: x, y: y, z: z.isFinite ? z : 0)
+        }
+        func dist3(_ a: Vec3, _ b: Vec3) -> Double {
+            let dx = a.x - b.x, dy = a.y - b.y, dz = (a.z ?? 0) - (b.z ?? 0)
+            return (dx * dx + dy * dy + dz * dz).squareRoot()
+        }
+        func hipCentreW(_ i: Int) -> Vec3? {
+            guard let l = w3(lh, i), let r = w3(rh, i) else { return nil }
+            return Vec3(x: (l.x + r.x) / 2, y: (l.y + r.y) / 2, z: ((l.z ?? 0) + (r.z ?? 0)) / 2)
+        }
+        func normPlanarDist(_ a: Int, _ b: Int, _ i: Int) -> Double? {
+            let ax = timeline.norm.x[a][i], ay = timeline.norm.y[a][i]
+            let bx = timeline.norm.x[b][i], by = timeline.norm.y[b][i]
+            guard ax.isFinite, bx.isFinite else { return nil }
+            let d = ((ax - bx) * (ax - bx) + (ay - by) * (ay - by)).squareRoot()
+            return d > 1e-9 ? d : nil
+        }
 
-            // 1. Learn the rigid torso for BOTH shoulders from confident
-            //    frames, before anything moves.
-            var models: [Int: TorsoModel] = [:]
+        // ---- 1. Clip statistics from confident frames --------------------
+        //
+        // A collapsed frame with confident visibility does feed the pools,
+        // and that is tolerated on purpose: collapses cluster in the top
+        // and finish windows, medians shrug off a minority, and excluding
+        // them would need the very statistics being learned.
 
-            for (occl, anchor) in [(ls, rs), (rs, ls)] {
-                var radii: [Double] = []
-                var sinSum = 0.0, cosSum = 0.0
-                var deltas: [Double] = []
-                for i in 0..<n {
-                    guard finite2(occl, i), finite2(anchor, i), let h = hipCentre(i),
-                          vis(occl, i) >= c.anchorMinVisibility,
-                          vis(anchor, i) >= c.anchorMinVisibility,
-                          vis(lh, i) >= c.anchorMinVisibility,
-                          vis(rh, i) >= c.anchorMinVisibility else { continue }
-                    let ox = bank.x[occl][i] - h.x, oy = bank.y[occl][i] - h.y
-                    let ax = bank.x[anchor][i] - h.x, ay = bank.y[anchor][i] - h.y
-                    let r = (ox * ox + oy * oy).squareRoot()
-                    guard r > 1e-6, (ax * ax + ay * ay).squareRoot() > 1e-6 else { continue }
-                    let delta = atan2(oy, ox) - atan2(ay, ax)
-                    radii.append(r)
-                    deltas.append(delta)
-                    sinSum += sin(delta)
-                    cosSum += cos(delta)
+        var widthsW: [Double] = []
+        var radiiL: [Double] = []
+        var radiiR: [Double] = []
+        var widthsNorm: [Double] = []
+        for i in 0..<n {
+            let anchored = vis(lh, i) >= c.anchorMinVisibility && vis(rh, i) >= c.anchorMinVisibility
+            guard anchored else { continue }
+            if vis(ls, i) >= c.anchorMinVisibility, vis(rs, i) >= c.anchorMinVisibility {
+                if let a = w3(ls, i), let b = w3(rs, i) {
+                    let w = dist3(a, b)
+                    if w > 1e-6 { widthsW.append(w) }
                 }
-                guard radii.count > 8 else { continue }
-
-                radii.sort()
-                let medianRadius = radii[radii.count / 2]
-                guard medianRadius > 1e-6 else { continue }
-
-                // Circular median of the angular offset: wrap every sample
-                // into the half-turn window around the circular mean, then
-                // take the ordinary median, which is robust to the odd
-                // mistracked frame the mean alone is not.
-                let circularMean = atan2(sinSum, cosSum)
-                var wrapped = deltas.map { d -> Double in
-                    var w = d - circularMean
-                    while w > .pi { w -= 2 * .pi }
-                    while w < -.pi { w += 2 * .pi }
-                    return w
-                }
-                wrapped.sort()
-                let medianDelta = circularMean + wrapped[wrapped.count / 2]
-
-                models[occl] = TorsoModel(radius: medianRadius, delta: medianDelta)
+                if let d = normPlanarDist(ls, rs, i) { widthsNorm.append(d) }
             }
-
-            // Where the rigid torso says a shoulder has to be, from the
-            // other shoulder's measured direction. Nil when the model or
-            // the anchors are not there to say it.
-            func implied(_ occl: Int, _ anchor: Int, _ i: Int) -> (x: Double, y: Double)? {
-                guard let m = models[occl], finite2(anchor, i), let h = hipCentre(i) else { return nil }
-                let ax = bank.x[anchor][i] - h.x, ay = bank.y[anchor][i] - h.y
-                guard (ax * ax + ay * ay).squareRoot() > 1e-6 else { return nil }
-                let theta = atan2(ay, ax) + m.delta
-                return (h.x + m.radius * cos(theta), h.y + m.radius * sin(theta))
-            }
-
-            // 1b. The medial collapse guard: which shoulder, if any, each
-            //     frame convicts. Needs both models (blame is comparative)
-            //     and confident hips (the ratio's denominator), and reads
-            //     no shoulder visibility at all, which is the point.
-            var convicted = [Int?](repeating: nil, count: n)
-            if c.collapseGuardEnabled,
-               let leftModel = models[ls], let rightModel = models[rs] {
-
-                var ratios: [Double] = []
-                for i in 0..<n {
-                    guard vis(lh, i) >= c.anchorMinVisibility,
-                          vis(rh, i) >= c.anchorMinVisibility,
-                          let sw = planarDist(ls, rs, i),
-                          let hw = planarDist(lh, rh, i) else { continue }
-                    ratios.append(sw / hw)
+            if let h = hipCentreW(i) {
+                if vis(ls, i) >= c.anchorMinVisibility, let a = w3(ls, i) {
+                    let r = dist3(a, h)
+                    if r > 1e-6 { radiiL.append(r) }
                 }
-                if ratios.count > 8 {
-                    ratios.sort()
-                    let medianRatio = ratios[ratios.count / 2]
-
-                    for i in 0..<n {
-                        guard vis(lh, i) >= c.anchorMinVisibility,
-                              vis(rh, i) >= c.anchorMinVisibility,
-                              let sw = planarDist(ls, rs, i),
-                              let hw = planarDist(lh, rh, i),
-                              sw / hw < c.collapseRatioFraction * medianRatio,
-                              let impliedLeft = implied(ls, rs, i),
-                              let impliedRight = implied(rs, ls, i) else { continue }
-
-                        // Each side's disagreement with its implication,
-                        // in units of its own median radius so the two
-                        // sides compare fairly.
-                        let dlx = bank.x[ls][i] - impliedLeft.x
-                        let dly = bank.y[ls][i] - impliedLeft.y
-                        let drx = bank.x[rs][i] - impliedRight.x
-                        let dry = bank.y[rs][i] - impliedRight.y
-                        let errLeft = (dlx * dlx + dly * dly).squareRoot() / leftModel.radius
-                        let errRight = (drx * drx + dry * dry).squareRoot() / rightModel.radius
-
-                        let floorBar = c.collapseMinErrorRadiusFraction
-                        if errLeft > floorBar, errLeft >= c.collapseErrorDominance * errRight {
-                            convicted[i] = ls
-                        } else if errRight > floorBar, errRight >= c.collapseErrorDominance * errLeft {
-                            convicted[i] = rs
-                        }
-                        // Both sides wrong, or neither dominant: convict
-                        // nobody; the torso ratio stage and the smoothing
-                        // own that frame.
-                    }
+                if vis(rs, i) >= c.anchorMinVisibility, let b = w3(rs, i) {
+                    let r = dist3(b, h)
+                    if r > 1e-6 { radiiR.append(r) }
                 }
             }
+        }
 
-            // 2. Project on occluded OR convicted frames with confident
-            //    anchors.
-            for (occl, anchor) in [(ls, rs), (rs, ls)] {
-                guard models[occl] != nil else { continue }
-                for i in 0..<n {
-                    let convictedHere = convicted[i] == occl
-                    guard finite2(occl, i),
-                          vis(occl, i) < c.occludedBelow || convictedHere,
-                          // A convicted anchor cannot vouch for the other
-                          // side this frame, whatever its visibility says:
-                          // transporting rotation across a shoulder the
-                          // guard just blamed would copy the error over.
-                          convicted[i] != anchor,
-                          vis(anchor, i) >= c.anchorMinVisibility,
-                          vis(lh, i) >= c.anchorMinVisibility,
-                          vis(rh, i) >= c.anchorMinVisibility,
-                          let p = implied(occl, anchor, i) else { continue }
-                    let blend = convictedHere ? Swift.max(c.blend, c.collapseBlend) : c.blend
-                    bank.x[occl][i] += blend * (p.x - bank.x[occl][i])
-                    bank.y[occl][i] += blend * (p.y - bank.y[occl][i])
-                    correctedFrames.insert(i)
-                    if convictedHere { collapseFrames.insert(i) }
+        func median(_ values: inout [Double]) -> Double? {
+            guard values.count > 8 else { return nil }
+            values.sort()
+            return values[values.count / 2]
+        }
+        guard let widthMedian = median(&widthsW),
+              let radiusLeft = median(&radiiL),
+              let radiusRight = median(&radiiR) else { return }
+        let normWidthMedian = median(&widthsNorm)
+        func radius(_ shoulder: Int) -> Double { shoulder == ls ? radiusLeft : radiusRight }
+
+        // ---- 1b. Conviction: pose-invariant collapse detection -----------
+
+        var convicted = [Int?](repeating: nil, count: n)
+        if c.collapseGuardEnabled {
+            for i in 0..<n {
+                guard vis(lh, i) >= c.anchorMinVisibility,
+                      vis(rh, i) >= c.anchorMinVisibility,
+                      let h = hipCentreW(i),
+                      let l = w3(ls, i), let r = w3(rs, i) else { continue }
+
+                // The world width crush, the primary test, and the norm
+                // neck-proximity emergency test. Either convicts the frame.
+                let worldWidth = dist3(l, r)
+                var frameCollapsed = worldWidth > 1e-9 && worldWidth < c.collapseWidthFraction * widthMedian
+                if !frameCollapsed, let nm = normWidthMedian,
+                   let planar = normPlanarDist(ls, rs, i),
+                   planar < c.neckProximityWidthFraction * nm {
+                    frameCollapsed = true
                 }
+                guard frameCollapsed else { continue }
+
+                // Blame: the side whose 3D radius from the hip centre has
+                // shrunk the most below its own clip median. The collapsed
+                // shoulder moved inward, so its radius deficit names it
+                // without reading any visibility, which is the point: the
+                // tracker reports these frames CONFIDENT.
+                let deficitL = (radiusLeft - dist3(l, h)) / radiusLeft
+                let deficitR = (radiusRight - dist3(r, h)) / radiusRight
+                let floorBar = c.collapseMinErrorRadiusFraction
+                if deficitL > floorBar, deficitL >= c.collapseErrorDominance * Swift.max(deficitR, 0) {
+                    convicted[i] = ls
+                } else if deficitR > floorBar, deficitR >= c.collapseErrorDominance * Swift.max(deficitL, 0) {
+                    convicted[i] = rs
+                }
+                // Neither side dominant: a genuinely bad frame convicts
+                // nobody; the torso ratio stage and the smoothing own it.
             }
-            timeline.setChannels(space, bank)
+        }
+
+        // ---- 2. The rigid-body reseat ------------------------------------
+        //
+        // Place the target on the intersection of the sphere of radius R
+        // about the hip centre and the sphere of radius W about the good
+        // shoulder, at the point nearest the measured position. When the
+        // spheres cannot meet (degraded data), alternate projections onto
+        // the two constraints, which lands on the nearest feasible
+        // compromise. Everything in world units, mirrored into norm below.
+
+        func reseatTarget(bad: Vec3, good: Vec3, hip: Vec3, r: Double, w: Double) -> Vec3 {
+            let nx = good.x - hip.x, ny = good.y - hip.y, nz = (good.z ?? 0) - (hip.z ?? 0)
+            let d = (nx * nx + ny * ny + nz * nz).squareRoot()
+
+            if d > 1e-6, d < r + w, d > Swift.abs(r - w) {
+                // Exact sphere-sphere circle.
+                let ux = nx / d, uy = ny / d, uz = nz / d
+                let a = (d * d + r * r - w * w) / (2 * d)
+                let rc = Swift.max(r * r - a * a, 0).squareRoot()
+                let cx = hip.x + ux * a, cy = hip.y + uy * a, cz = (hip.z ?? 0) + uz * a
+                var px = bad.x - cx, py = bad.y - cy, pz = (bad.z ?? 0) - cz
+                let along = px * ux + py * uy + pz * uz
+                px -= along * ux; py -= along * uy; pz -= along * uz
+                var pl = (px * px + py * py + pz * pz).squareRoot()
+                if pl < 1e-9 {
+                    // Measured point sits on the axis: pick a stable
+                    // perpendicular (cross with world up, then fallback).
+                    px = uy * 0 - uz * 1; py = uz * 0 - ux * 0; pz = ux * 1 - uy * 0
+                    pl = (px * px + py * py + pz * pz).squareRoot()
+                    if pl < 1e-9 { px = 0; py = 0; pz = 1; pl = 1 }
+                }
+                return Vec3(x: cx + px / pl * rc, y: cy + py / pl * rc, z: cz + pz / pl * rc)
+            }
+
+            // Alternating projections fallback: width first (the collapse
+            // signature), radius second, width again. From a shoulder
+            // collapsed onto the neck, the measured direction good -> bad
+            // points across the neck toward the true side, so extending it
+            // to the true width already lands close.
+            var t = bad
+            for pass in 0..<3 {
+                let anchor = pass == 1 ? hip : good
+                let target = pass == 1 ? r : w
+                var dx = t.x - anchor.x, dy = t.y - anchor.y, dz = (t.z ?? 0) - (anchor.z ?? 0)
+                var l = (dx * dx + dy * dy + dz * dz).squareRoot()
+                if l < 1e-9 { dx = 0; dy = 0; dz = 1; l = 1 }
+                t = Vec3(
+                    x: anchor.x + dx / l * target,
+                    y: anchor.y + dy / l * target,
+                    z: (anchor.z ?? 0) + dz / l * target
+                )
+            }
+            return t
+        }
+
+        for (occl, anchor) in [(ls, rs), (rs, ls)] {
+            for i in 0..<n {
+                let convictedHere = convicted[i] == occl
+                guard vis(occl, i) < c.occludedBelow || convictedHere,
+                      // A convicted anchor cannot vouch for the other side
+                      // this frame, whatever its visibility says.
+                      convicted[i] != anchor,
+                      vis(anchor, i) >= c.anchorMinVisibility,
+                      vis(lh, i) >= c.anchorMinVisibility,
+                      vis(rh, i) >= c.anchorMinVisibility,
+                      let bad = w3(occl, i), let good = w3(anchor, i),
+                      let hip = hipCentreW(i) else { continue }
+
+                let target = reseatTarget(
+                    bad: bad, good: good, hip: hip,
+                    r: radius(occl), w: widthMedian
+                )
+                let blend = convictedHere ? Swift.max(c.blend, c.collapseBlend) : c.blend
+                let dx = blend * (target.x - bad.x)
+                let dy = blend * (target.y - bad.y)
+                let dz = blend * ((target.z ?? 0) - (bad.z ?? 0))
+
+                timeline.world.x[occl][i] += dx
+                timeline.world.y[occl][i] += dy
+                if timeline.world.z[occl][i].isFinite {
+                    timeline.world.z[occl][i] += dz
+                }
+
+                // Mirror the planar part of the move into the normalised
+                // set, scaled by this frame's own hip width in each space,
+                // the same per-frame scale bridge the GMM stage uses, so
+                // the overlay and the 3D figure keep moving together. The
+                // norm z is left alone: it is a camera-relative estimate
+                // the reseat has no business inventing.
+                if timeline.norm.x[occl][i].isFinite,
+                   let hwWorld = { () -> Double? in
+                       guard let a = w3(lh, i), let b = w3(rh, i) else { return nil }
+                       let d = dist3(a, b)
+                       return d > 1e-6 ? d : nil
+                   }(),
+                   let hwNorm = normPlanarDist(lh, rh, i) {
+                    let s = hwNorm / hwWorld
+                    timeline.norm.x[occl][i] += dx * s
+                    timeline.norm.y[occl][i] += dy * s
+                }
+
+                correctedFrames.insert(i)
+                if convictedHere { collapseFrames.insert(i) }
+            }
         }
 
         qc.shoulderProjectionFrames += correctedFrames.count
@@ -1286,8 +1640,27 @@ public final class PosePriorCorrector {
         guard shin > 1e-6, abs(hipMedianY - footMedianY) > 1e-6 else { return nil }
 
         // Which way is up: the hips sit above the feet, whatever the axis
-        // convention. In image space hips have SMALLER y, so up = -1 there.
-        let up: Double = hipMedianY < footMedianY ? -1 : 1
+        // convention. up is defined so that (level - y) * up is the height
+        // of y ABOVE the plane, positive above, negative sunk below.
+        //
+        // THE SIGN BUG THIS LINE USED TO CARRY, recorded so it can never
+        // come back: the previous form returned -1 in image space (hips at
+        // smaller y) and +1 in a y-up world, which made heightAbove come
+        // out NEGATIVE for points above the plane in BOTH spaces under
+        // BOTH conventions. Every rule downstream then ran inverted: the
+        // penetration clamp fired on lifted heels and pressed them onto
+        // the turf, genuine penetrations were never clamped at all, the
+        // ankle anchor pinned the ankle from above while ignoring the
+        // sink, and the heel lift counter counted penetrations. The QC
+        // numbers looked plausible throughout, which is how the inversion
+        // survived four rounds of features being stacked on top of it.
+        //
+        // Derivation check, both conventions: image space has hips at
+        // SMALLER y and ground at larger y, so height above ground grows
+        // with (level - y) and up must be +1 there; a y-up world has hips
+        // at LARGER y and ground at smaller y, so height above ground
+        // grows with (y - level) and up must be -1.
+        let up: Double = hipMedianY < footMedianY ? 1 : -1
 
         // Per side turf level: the toward-ground 75th percentile of that
         // foot's pooled heel and toe y. Lifted-heel frames sit on the
@@ -1302,7 +1675,10 @@ public final class PosePriorCorrector {
             guard ys.count > 8 else { return nil }
             // Sort so that the ground end comes last, then take the 75th
             // percentile toward it.
-            ys.sort { up < 0 ? $0 < $1 : $0 > $1 }
+            // Toward-ground end last, under the corrected up sign: with
+            // up = +1 (image-like, ground at large y) ascending puts the
+            // ground end last; with up = -1 (y-up world) descending does.
+            ys.sort { up > 0 ? $0 < $1 : $0 > $1 }
             return ys[min(ys.count - 1, (ys.count * 3) / 4)]
         }
         guard let left = level(feet[0]), let right = level(feet[1]) else { return nil }
@@ -1318,7 +1694,10 @@ public final class PosePriorCorrector {
                 ys.append(bank.y[side.ankle][i])
             }
             guard ys.count > 8 else { return nil }
-            ys.sort { up < 0 ? $0 < $1 : $0 > $1 }
+            // Toward-ground end last, under the corrected up sign: with
+            // up = +1 (image-like, ground at large y) ascending puts the
+            // ground end last; with up = -1 (y-up world) descending does.
+            ys.sort { up > 0 ? $0 < $1 : $0 > $1 }
             return ys[min(ys.count - 1, (ys.count * 3) / 4)]
         }
 
@@ -1357,22 +1736,96 @@ public final class PosePriorCorrector {
             // about missingness. See the config note for why the median
             // and not the brief's literal zero.
             if c.flattenFootDepth {
-                let footJoints = [
-                    Landmarks.LEFT_HEEL, Landmarks.LEFT_FOOT_INDEX, Landmarks.LEFT_ANKLE,
-                    Landmarks.RIGHT_HEEL, Landmarks.RIGHT_FOOT_INDEX, Landmarks.RIGHT_ANKLE,
+                let sidesJoints: [(heel: Int, toe: Int, ankle: Int)] = [
+                    (Landmarks.LEFT_HEEL, Landmarks.LEFT_FOOT_INDEX, Landmarks.LEFT_ANKLE),
+                    (Landmarks.RIGHT_HEEL, Landmarks.RIGHT_FOOT_INDEX, Landmarks.RIGHT_ANKLE),
                 ]
-                for j in footJoints where j < timeline.jointCount {
-                    var zs: [Double] = []
-                    for i in 0..<timeline.frameCount where bank.z[j][i].isFinite {
-                        zs.append(bank.z[j][i])
+                for sj in sidesJoints where max(sj.heel, sj.toe, sj.ankle) < timeline.jointCount {
+
+                    func medianOf(_ values: [Double]) -> Double? {
+                        guard values.count > 8 else { return nil }
+                        let s = values.sorted()
+                        return s[s.count / 2]
                     }
-                    guard zs.count > 8 else { continue }
-                    zs.sort()
-                    let medianZ = zs[zs.count / 2]
-                    for i in 0..<timeline.frameCount where bank.z[j][i].isFinite {
-                        bank.z[j][i] = medianZ
+
+                    // Pre-flatten shape statistics for the restore below:
+                    // the clip-median 3D heel to toe length, and the
+                    // median depth offsets of heel and toe from the ankle
+                    // (signs included, they carry which way the foot
+                    // points in this space).
+                    var lengths3: [Double] = []
+                    var heelOffsets: [Double] = []
+                    var toeOffsets: [Double] = []
+                    for i in 0..<timeline.frameCount {
+                        let hx = bank.x[sj.heel][i], hy = bank.y[sj.heel][i], hz = bank.z[sj.heel][i]
+                        let tx = bank.x[sj.toe][i], ty = bank.y[sj.toe][i], tz = bank.z[sj.toe][i]
+                        let az = bank.z[sj.ankle][i]
+                        if hx.isFinite, tx.isFinite, hz.isFinite, tz.isFinite {
+                            let dx = hx - tx, dy = hy - ty, dz = hz - tz
+                            let l = (dx * dx + dy * dy + dz * dz).squareRoot()
+                            if l > 1e-9 { lengths3.append(l) }
+                        }
+                        if hz.isFinite, az.isFinite { heelOffsets.append(hz - az) }
+                        if tz.isFinite, az.isFinite { toeOffsets.append(tz - az) }
                     }
-                    flattenedDepth = true
+
+                    // The flattening itself, unchanged: each joint's depth
+                    // becomes its own clip median, written only where a
+                    // (noisy) value was, so missingness cannot drift.
+                    var flattenedZ: [Int: Double] = [:]
+                    for j in [sj.heel, sj.toe, sj.ankle] {
+                        var zs: [Double] = []
+                        for i in 0..<timeline.frameCount where bank.z[j][i].isFinite {
+                            zs.append(bank.z[j][i])
+                        }
+                        guard let medianZ = medianOf(zs) else { continue }
+                        for i in 0..<timeline.frameCount where bank.z[j][i].isFinite {
+                            bank.z[j][i] = medianZ
+                        }
+                        flattenedZ[j] = medianZ
+                        flattenedDepth = true
+                    }
+
+                    // The rigid restore (world space, where the 3D figure
+                    // reads its depth). Independent per-joint medians of a
+                    // noisy channel can land nearly on top of each other,
+                    // and down the line the planar heel to toe separation
+                    // is small too, so the flattened foot can degenerate
+                    // into three near-coincident columns: the audits'
+                    // "three vertical joints". When the flattened foot's
+                    // median 3D length has collapsed well under the length
+                    // the clip actually measured, the two constant depths
+                    // are spread back apart about the ankle's, keeping
+                    // their measured signs and proportion. Depth stays a
+                    // constant per joint, so none of the noise the
+                    // flattening removed can return.
+                    if space == .world, c.restoreFootLengthAfterFlatten,
+                       let zh = flattenedZ[sj.heel], let zt = flattenedZ[sj.toe], let za = flattenedZ[sj.ankle],
+                       let trueLength = medianOf(lengths3),
+                       let oh = medianOf(heelOffsets), let ot = medianOf(toeOffsets) {
+                        var planars: [Double] = []
+                        for i in 0..<timeline.frameCount {
+                            let hx = bank.x[sj.heel][i], hy = bank.y[sj.heel][i]
+                            let tx = bank.x[sj.toe][i], ty = bank.y[sj.toe][i]
+                            guard hx.isFinite, tx.isFinite else { continue }
+                            planars.append(((hx - tx) * (hx - tx) + (hy - ty) * (hy - ty)).squareRoot())
+                        }
+                        if let planarMedian = medianOf(planars) {
+                            let currentDepth = zh - zt
+                            let current3 = (planarMedian * planarMedian + currentDepth * currentDepth).squareRoot()
+                            let separation = oh - ot
+                            if current3 < 0.6 * trueLength, abs(separation) > 1e-6 {
+                                let neededDepth = Swift.max(trueLength * trueLength - planarMedian * planarMedian, 0).squareRoot()
+                                let k = neededDepth / abs(separation)
+                                let newZh = za + oh * k
+                                let newZt = za + ot * k
+                                for i in 0..<timeline.frameCount {
+                                    if bank.z[sj.heel][i].isFinite { bank.z[sj.heel][i] = newZh }
+                                    if bank.z[sj.toe][i].isFinite { bank.z[sj.toe][i] = newZt }
+                                }
+                            }
+                        }
+                    }
                 }
             }
 
@@ -1395,13 +1848,22 @@ public final class PosePriorCorrector {
 
             for side in footSides {
                 let anchoredAnkle: Double? = {
-                    guard c.ankleAnchorEnabled, let level = side.ankleLevel else { return nil }
-                    // Degenerate guard: an ankle level that landed below
-                    // the turf estimate is noise stacked on noise, and an
-                    // anchor there would pin the ankle underground. The
-                    // plain turf clamp owns the ankle instead.
+                    guard c.ankleAnchorEnabled else { return nil }
+                    // The floored form of the degenerate guard. An ankle
+                    // level that landed at or below turf plus the joint's
+                    // minimum anatomical height is noise stacked on noise,
+                    // but the OLD answer (return nil, hand the ankle to
+                    // the bare turf clamp) let the clamp legally park the
+                    // ankle ON the ground, a flattened foot by
+                    // construction. The anchor now always runs, at the
+                    // measured level when that level is anatomically
+                    // possible and at turf plus the minimum height when
+                    // it is not. y at height h above turf: level - up * h.
+                    let minHeight = c.minAnkleHeightShinFraction * plane.shin
+                    let lifted = side.level - plane.up * minHeight
+                    guard let level = side.ankleLevel else { return lifted }
                     let heightAboveTurf = (side.level - level) * plane.up
-                    return heightAboveTurf >= 0 ? level : nil
+                    return heightAboveTurf >= minHeight ? level : lifted
                 }()
 
                 for i in 0..<timeline.frameCount {
@@ -1515,20 +1977,40 @@ public final class PosePriorCorrector {
         qc.priorRangeCorrections += correctedFrames.count
     }
 
-    // MARK: - Grip cluster anchor (Fix G)
+    // MARK: - Grip cluster anchor (Fix G, rebuilt)
 
     /*
-      See GripClusterConfig for the failure and the reasoning. The stage
-      fires only on the exact audited signature: one wrist trusted, the
-      other weak (a hold or a deeply dimmed sample), and the pair wider
-      apart than this golfer's own clip says a grip can be. The weak wrist
-      is then drawn radially toward the trusted one until their separation
-      matches the clip's confident grip median. Direction is preserved,
-      distance is the only assertion, depth is untouched (the grip
-      statement is an image-plane statement, the shoulder projection's own
-      rule), and each space runs with its own medians and units. Frames
-      are counted once into qc.gripClusterFrames however many spaces
-      fired, matching how the bone projection counts.
+      See GripClusterConfig for the failure and the reasoning. Rebuilt by
+      the skeleton overhaul around the three ways the audits showed the old
+      stage going quiet or pulling wrong:
+
+        THE WEAK BAND was 0.3 and below, which covered the long-gap holds
+        (0.12) but not the short-gap PCHIP bridges, whose visibility is
+        the weaker neighbour times 0.95 and lands well above 0.3. A
+        bridged wrist drifting off the club was untouchable. The band now
+        reaches everything under the anchor bar, and the pull scales with
+        weakness, so a hold takes the full blend and a mid-trust bridge a
+        fraction.
+
+        THE ANCHOR BAR was 0.6, and through the very windows where one
+        wrist is held the other often reads 0.5 to 0.6: still a real
+        measurement, but under the bar, so the stage went dead exactly
+        when it was needed. The anchor bar is now its own knob at 0.5.
+
+        THE TARGET kept the weak wrist's own bearing from the anchor, a
+        bearing inherited from wherever the hold froze, so the pull could
+        park the hand at grip DISTANCE but on the wrong side of the
+        handle. The target now runs along the anchor side's own measured
+        forearm axis (the club hangs off that axis at the grip), signed
+        toward the weak wrist's current side, with the old radial pull as
+        the fallback when the elbow is dim.
+
+      The trigger also came down (see the config), and the pull now fades
+      in over a few frames at the start of each corrected run, so the
+      anchor engaging reads as a glide rather than a step. Distance and
+      bearing are image-plane statements per space, depth stays untouched,
+      each space runs with its own medians and units, and frames are
+      counted once into qc.gripClusterFrames however many spaces fired.
     */
     private func anchorGripCluster(_ timeline: inout PoseTimeline, qc: inout TrackingQC) {
         let c = config.gripCluster
@@ -1613,33 +2095,90 @@ public final class PosePriorCorrector {
                 c.fallbackSeparationForearmFraction * medianForearm
             )
 
+            // Pass 1: decide the correction for every firing frame, but
+            // write nothing yet, so the edge ramp below can see whole
+            // corrected runs before any sample moves.
+            var corrections: [Int: (joint: Int, dx: Double, dy: Double)] = [:]
+
             for i in 0..<n {
                 guard let s = separation(i), s > trigger else { continue }
                 let leftVis = vis(lw, i), rightVis = vis(rw, i)
 
-                // Exactly one side trusted, the other weak, or nothing
+                // Exactly one side anchored, the other weak, or nothing
                 // moves: two trusted wrists far apart are a measurement
                 // (a hand off the club), two weak wrists have no anchor.
+                // The bars are disjoint (0.5 over 0.45), so at most one
+                // side can qualify for each role.
                 let weak: Int
-                if rightVis >= c.trustedMinVisibility, leftVis <= c.weakMaxVisibility {
+                if rightVis >= c.anchorMinVisibility, leftVis < c.weakMaxVisibility {
                     weak = lw
-                } else if leftVis >= c.trustedMinVisibility, rightVis <= c.weakMaxVisibility {
+                } else if leftVis >= c.anchorMinVisibility, rightVis < c.weakMaxVisibility {
                     weak = rw
                 } else {
                     continue
                 }
                 let anchor = weak == lw ? rw : lw
+                let anchorElbow = anchor == lw ? le : re
+                let weakVis = weak == lw ? leftVis : rightVis
 
-                // Radial pull: the weak wrist keeps its direction from the
-                // anchor and only its distance is drawn in to the clip's
-                // own grip separation.
-                let ux = (bank.x[weak][i] - bank.x[anchor][i]) / s
-                let uy = (bank.y[weak][i] - bank.y[anchor][i]) / s
+                // Weakness-scaled blend: a hold at the cleanup's 0.12
+                // takes the full pull, a bridge just under the band edge
+                // roughly a third of it.
+                let span = Swift.max(c.weakMaxVisibility - 0.12, 1e-6)
+                let weakness = Geometry.clamp((c.weakMaxVisibility - weakVis) / span, 0, 1)
+                let blend = c.blend * (0.35 + 0.65 * weakness)
+
+                // The bearing: the anchor side's own forearm axis when
+                // its elbow can vouch for it, signed toward the weak
+                // wrist's current side; the weak wrist's stale bearing
+                // otherwise.
+                var ux = (bank.x[weak][i] - bank.x[anchor][i]) / s
+                var uy = (bank.y[weak][i] - bank.y[anchor][i]) / s
+                if c.forearmDirectionTarget, finite2(anchorElbow, i),
+                   vis(anchorElbow, i) >= c.weakMaxVisibility {
+                    let fx = bank.x[anchor][i] - bank.x[anchorElbow][i]
+                    let fy = bank.y[anchor][i] - bank.y[anchorElbow][i]
+                    let fl = (fx * fx + fy * fy).squareRoot()
+                    if fl > 1e-9 {
+                        let sign: Double = (fx * ux + fy * uy) >= 0 ? 1 : -1
+                        ux = fx / fl * sign
+                        uy = fy / fl * sign
+                    }
+                }
+
                 let targetX = bank.x[anchor][i] + ux * gripSep
                 let targetY = bank.y[anchor][i] + uy * gripSep
-                bank.x[weak][i] += c.blend * (targetX - bank.x[weak][i])
-                bank.y[weak][i] += c.blend * (targetY - bank.y[weak][i])
-                correctedFrames.insert(i)
+                corrections[i] = (
+                    joint: weak,
+                    dx: blend * (targetX - bank.x[weak][i]),
+                    dy: blend * (targetY - bank.y[weak][i])
+                )
+            }
+
+            // Pass 2: apply, fading in over the first edgeRampFrames of
+            // each corrected run. No fade at the run's end: a run usually
+            // ends at re-acquisition, and the last held frames should sit
+            // as close to the returning truth as the pull can put them.
+            let firing = corrections.keys.sorted()
+            var runs: [[Int]] = []
+            for f in firing {
+                if let last = runs.last?.last, f == last + 1 {
+                    runs[runs.count - 1].append(f)
+                } else {
+                    runs.append([f])
+                }
+            }
+            let ramp = Swift.max(c.edgeRampFrames, 0)
+            for run in runs {
+                for (k, i) in run.enumerated() {
+                    guard let corr = corrections[i] else { continue }
+                    let scale = ramp > 0
+                        ? Swift.min(1, Double(k + 1) / Double(ramp + 1))
+                        : 1
+                    bank.x[corr.joint][i] += corr.dx * scale
+                    bank.y[corr.joint][i] += corr.dy * scale
+                    correctedFrames.insert(i)
+                }
             }
 
             timeline.setChannels(space, bank)
