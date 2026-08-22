@@ -120,14 +120,49 @@
 //    weak wrist is drawn back to grip distance from the trusted one.
 //    Counted in qc.gripClusterFrames.
 //
+//  ROUND FOUR: DTL + FACE-ON OVERHAUL. Four additions and two pieces of
+//  plumbing, each detailed at its implementation site:
+//
+//    The grip cluster anchor gains a RIGID-HAND CARRY (R1): the wrist's
+//    correction is applied identically to that side's held knuckles, so
+//    the hand rides the wrist instead of kinking into the audited V at
+//    the forearm-wrist-knuckle polyline.
+//
+//    The shoulder stage gains a SYMMETRIC COLLAPSE BRANCH (R2): a width
+//    conviction with no dominant side used to convict nobody, which is
+//    exactly how the face-on black-shirt frames survived every round;
+//    both shoulders are now reseated together at a softer blend.
+//
+//    The ground stage gains a TOE PIVOT PLANT (R3): during a detected
+//    heel lift the toe is planted at exact turf level with zero
+//    tolerance, because a pivot is by definition a planted toe. Mirrored
+//    into the post-smoothing backstop. Counted in qc.toePivotPlants.
+//
+//    A KNEE DEPTH-CONSISTENCY stage (R4) un-mirrors MediaPipe's
+//    depth-flipped knees against each knee's own running offset from its
+//    hip, BEFORE the fold guard can misread the mirror as hyperextension.
+//    Counted in qc.kneeDepthFlipsCorrected.
+//
+//    The view profiles gain this round's tuning deltas (verdicts 3, 6, 7
+//    and 8), and run() accepts an optional preclassified view from the
+//    orchestrator, so one clip-level classification can route every
+//    view-aware stage in the pipeline consistently. The applied view is
+//    recorded in qc.detectedViewLabel.
+//
 //  ORDER OF OPERATIONS (conflict C3, amended by the skeleton overhaul)
 //
 //    0. view profile                  clip-level DTL versus face-on
 //                                     classification routes per-view
 //                                     thresholds through one pipeline
+//                                     (round four: the orchestrator may
+//                                     hand the classification in; nil
+//                                     self-classifies as before)
 //    1. shoulder projection           FIRST, world-space rigid-body reseat
 //                                     (Fix S rebuilt, collapse guard on
-//                                     pose-invariant width and radius).
+//                                     pose-invariant width and radius;
+//                                     round four adds the symmetric
+//                                     branch for the no-dominant-side
+//                                     conviction).
 //                                     Before the bones on purpose: the
 //                                     bone stage restores length by moving
 //                                     the DISTAL joint, so running it
@@ -143,17 +178,27 @@
 //    1c. bone-length projection       world space, pose-invariant lengths,
 //                                     proximal to distal from corrected
 //                                     roots
+//    1d. knee depth consistency       world space, z channel only (round
+//                                     four, R4): a depth-mirrored knee is
+//                                     un-mirrored about its own hip depth
+//                                     BEFORE the fold guard, which would
+//                                     otherwise read the mirror as
+//                                     hyperextension and fix the wrong
+//                                     thing
 //    2. impossible-fold relaxation    world space
 //    2b. ground plane                 both spaces, feet only (Fix 4,
 //                                     extended: the up-sign inversion is
 //                                     FIXED, depth flattening now restores
 //                                     the rigid foot length, the ankle
-//                                     anchor is floored above the turf)
+//                                     anchor is floored above the turf;
+//                                     round four adds the toe pivot plant
+//                                     during heel lift, R3)
 //    2c. grip cluster anchor          both spaces, weak wrist only (Fix G
 //                                     rebuilt: wider weak band, weakness
 //                                     scaled pull, forearm-axis target,
-//                                     edge ramps), before the hand
-//                                     collapse guard so the palm is
+//                                     edge ramps; round four adds the
+//                                     rigid-hand carry, R1), before the
+//                                     hand collapse guard so the palm is
 //                                     restored against a wrist that is
 //                                     already back on the club
 //    3. hand collapse guard           both spaces, both hands. The Gemini
@@ -364,6 +409,16 @@ public struct ShoulderProjectionConfig {
     /// path's soft 0.5 because a confidently wrong guess carries no
     /// residual signal worth splitting the correction with.
     public var collapseBlend: Double = 0.85
+    /// Round four (R2): the blend for the SYMMETRIC branch, when the
+    /// width conviction fires but the radius-deficit dominance test names
+    /// no side. Deliberately softer than the one-sided 0.85: with no
+    /// dominant side the evidence about where the pair should sit is
+    /// weaker, and both joints move, so each may still carry some honest
+    /// signal worth keeping a share of. Too firm and a genuinely narrow
+    /// measured pose (arms crossed at the finish) gets shoved; too soft
+    /// and the black-shirt frames stay pinched. 0.6 against the face-on
+    /// width conviction at 0.68 is the balance.
+    public var symmetricCollapseBlend: Double = 0.6
 
     public init() {}
 }
@@ -626,7 +681,77 @@ public struct GroundPlaneConfig {
     /// the audits show. The restore keeps depth constant per joint, so
     /// no per-frame depth noise returns; only the constants move apart.
     public var restoreFootLengthAfterFlatten: Bool = true
+    /// Round four (R3): during a detected heel lift the same side's toe
+    /// is planted at exact turf level with zero tolerance, in the main
+    /// stage and the post-smoothing backstop alike, because a heel lift
+    /// IS a toe pivot and the pivot point bears the weight. Off restores
+    /// the previous behaviour (rule 3 counts and touches nothing) for
+    /// diffing. See rule 3 in applyGroundConstraints for the reasoning.
+    public var toePivotPlant: Bool = true
 
+    public init() {}
+}
+
+// MARK: - Knee depth consistency (round four, R4)
+
+/*
+  The failure, from the DTL frame audits: a hyperextended, backward-pointing
+  knee while the hip depth holds steady. MediaPipe's per-joint z mirrors
+  under occlusion, and nothing in the pipeline checked depth-sign
+  consistency: cleanup rejects whole samples, never a single channel; the
+  fold guard reasons about angles after the damage, and a mirrored knee
+  reads to it as hyperextension, inviting it to fix the wrong thing; the
+  provider passes world z through untouched, and the knee guard proposed
+  for the provider was moved here on purpose (verdict 23), because the
+  provider is a pure per-frame source and this test needs full-clip
+  statistics.
+
+  The signature is crisp, and all three clauses of the trigger come from
+  it: the sign of (kneeZ minus the same side's hipZ) inverts against a
+  9-frame running median of that offset, with magnitude about twice the
+  running offset, while the hip's own z step stays small. So a frame fires
+  only when (1) the sign inverts against the running median, (2) the
+  same-side hip z step to its finite neighbours is under the stability bar
+  (if the hip depth jumped too, the inversion may be the hip's error, and
+  correcting the knee against a bad hip would launder it), and (3) the
+  offset magnitude clears the floor, because near zero, where a knee sits
+  almost exactly under its hip at address, the sign is meaningless and
+  would flap.
+
+  The correction undoes the mirror: the offset is negated about the hip z
+  (newKneeZ = 2 hipZ minus kneeZ), blended at 0.8, firm because a mirrored
+  depth is a failure signature carrying no residual signal worth keeping,
+  but still not a snap, the house style. World space only, z channel only:
+  the x and y the tracker measured are untouched, norm z is a
+  camera-relative estimate this stage has no business editing, and on a
+  backend with no finite world z (Vision) every guard fails and the stage
+  is inert, the honest behaviour. Capped at 20 percent of frames per knee:
+  a clip past the cap has a depth channel broken beyond a mirror fix, and
+  the counter sitting at exactly the cap IS the flag, the cleanup valve's
+  philosophy. Counted in qc.kneeDepthFlipsCorrected.
+*/
+public struct KneeDepthConfig {
+    public var enabled: Bool = true
+    /// Half-width of the running-median window: 4 gives the 9-frame
+    /// window the trigger is defined against.
+    public var windowRadius: Int = 4
+    /// Clause 3's floor: the offset must be at least this fraction of the
+    /// clip-median world shin for its sign to mean anything. Too low and
+    /// address frames flap; too high and shallow flips slip through.
+    public var minOffsetShinFraction: Double = 0.05
+    /// Clause 2's stability bar: the same-side hip z step to each finite
+    /// neighbour frame must stay under this fraction of the shin. The
+    /// default is this file's own choice, recorded as such: the flip
+    /// signature moves the knee z by roughly two offsets (at least 0.10
+    /// shins at the floor) while a stable hip moves far less, so the bar
+    /// sits at the offset floor itself.
+    public var hipStabilityStepFraction: Double = 0.05
+    /// How far the mirrored offset moves back toward its un-mirrored
+    /// position. Firm; see the note above.
+    public var blend: Double = 0.8
+    /// The per-knee valve: corrections stop past this fraction of the
+    /// knee's usable (finite-offset) frames.
+    public var maxFraction: Double = 0.2
     public init() {}
 }
 
@@ -862,6 +987,8 @@ public final class PosePriorCorrector {
         public var torsoBlend: Double = 0.6
         /// Fix 4 (extended): the ground plane stage's knobs.
         public var ground = GroundPlaneConfig()
+        /// Round four (R4): the knee depth-consistency stage's knobs.
+        public var kneeDepth = KneeDepthConfig()
         /// Fix S: the shoulder occlusion projection's knobs, medial
         /// collapse guard included.
         public var shoulder = ShoulderProjectionConfig()
@@ -914,16 +1041,40 @@ public final class PosePriorCorrector {
     }
 
     public func run(_ timeline: inout PoseTimeline, qc: inout TrackingQC) {
+        run(&timeline, qc: &qc, view: nil)
+    }
+
+    /*
+      Round four: the orchestrator classifies the clip ONCE, after cleanup,
+      and threads the result through every view-routed stage (the cleanup
+      config factory, the RTS factory, the smoothing bands, Biomechanics
+      and this corrector), so a borderline clip can never end up with DTL
+      shoulders and face-on wrists. Nil keeps the self-classification
+      exactly as before, so an orchestrator that lags this commit changes
+      nothing. Internal rather than public because SwingView itself is
+      declared internal (MediaPipePoseProvider.swift), which is also why
+      the public two-argument entry above must remain a separate function
+      instead of gaining the parameter. The two coexist safely: a
+      two-argument call binds the entry above (Swift prefers the overload
+      that needs no default arguments filled), and only an explicit view
+      reaches this one.
+    */
+    func run(_ timeline: inout PoseTimeline, qc: inout TrackingQC, view: SwingView? = nil) {
         guard timeline.frameCount > 2 else { return }
 
         // Route the view profile first (the research brief's "separate DTL
         // and face-on tracking"): the same stages run in both views, but
-        // each view's known failure modes get its own thresholds. The
+        // each view's known failure modes get its own thresholds. A
+        // preclassified view from the orchestrator wins; otherwise the
         // classification is clip-level and internal, so UploadProcessor's
-        // wiring is unchanged.
-        let view = SwingViewClassifier.classifyClip(timeline)
-        detectedView = view
-        config = Self.profiled(baseConfig, for: view)
+        // wiring is unchanged either way.
+        let resolvedView = view ?? SwingViewClassifier.classifyClip(timeline)
+        detectedView = resolvedView
+        // The QC record of which profile actually ran (round four): the
+        // corrector is the one place the applied view is known for
+        // certain, so it is the label's only writer.
+        qc.detectedViewLabel = resolvedView == .faceOn ? "faceOn" : "downTheLine"
+        config = Self.profiled(baseConfig, for: resolvedView)
 
         projectOccludedShoulders(&timeline, qc: &qc)    // Fix S rebuilt. FIRST,
                                                         // before the bones: the
@@ -944,6 +1095,15 @@ public final class PosePriorCorrector {
         projectBoneLengths(&timeline, qc: &qc)          // proximal to distal,
                                                         // from the corrected
                                                         // shoulders and hips
+        enforceKneeDepthConsistency(&timeline, qc: &qc) // round four, R4:
+                                                        // un-mirror flipped
+                                                        // knee depth BEFORE
+                                                        // the fold guard,
+                                                        // which reads a
+                                                        // mirrored knee as
+                                                        // hyperextension
+                                                        // and would fix
+                                                        // the wrong thing
         relaxImpossibleFolds(&timeline, qc: &qc)
         applyGroundConstraints(&timeline, qc: &qc)      // Fix 4 extended, feet only
         anchorGripCluster(&timeline, qc: &qc)           // Fix G rebuilt, before
@@ -990,6 +1150,13 @@ public final class PosePriorCorrector {
     */
     private static func profiled(_ base: Config, for view: SwingView) -> Config {
         var c = base
+        // Round four (verdict 8), both views: the ankle's snap zone widens
+        // from 0.08 to 0.10 shins. The ankle level is an estimate stacked
+        // on the turf estimate, and the audited hover sat just outside the
+        // old zone. 0.12 was proposed and trimmed: on a typical shin that
+        // is about 5 cm of grab, uncomfortably close to the ankle's own
+        // resting height above the sole.
+        c.ground.ankleSnapZoneShinFraction = Swift.max(c.ground.ankleSnapZoneShinFraction, 0.10)
         switch view {
         case .downTheLine:
             // The crossing wrist detaches earlier and further here: fire
@@ -1002,6 +1169,11 @@ public final class PosePriorCorrector {
             // Foot depth is at its noisiest with the feet pointing along
             // the optical axis; the flattening stays firmly on.
             c.ground.flattenFootDepth = true
+            // Round four (verdict 6): heel and toe hover wider here for
+            // the same depth-noise reason, so the near-plane snap zone
+            // widens to 0.10 shins. Secondary to the toe pivot plant,
+            // which is the real fix for the audited dragging toe.
+            c.ground.snapZoneShinFraction = Swift.max(c.ground.snapZoneShinFraction, 0.10)
         case .faceOn:
             // Shoulders are broadside and honest: demand a harder crush
             // before convicting, so a big honest turn is never touched.
@@ -1009,6 +1181,21 @@ public final class PosePriorCorrector {
             // The hands overlap around impact but re-acquire fast; a
             // slightly looser trigger avoids fighting the natural stagger.
             c.gripCluster.separationTriggerFactor = Swift.max(c.gripCluster.separationTriggerFactor, 1.3)
+            // Round four (verdict 3): a broadside shoulder in the 0.5 to
+            // 0.6 visibility band is usually an honest measurement, and
+            // the black-shirt failure reports HIGH visibility anyway, so
+            // this bar could never catch it wherever it sat. Lowering it
+            // stops the soft 0.5-blend corrections of honest samples; the
+            // collapse guard and the symmetric branch own the real
+            // failure.
+            c.shoulder.occludedBelow = Swift.min(c.shoulder.occludedBelow, 0.5)
+            // Round four (verdicts 6 and 7): the near-plane snap zone
+            // widens to 0.08 shins and the ankle pull firms to 0.65,
+            // against the audited lag float at the ankle. 0.70 was
+            // proposed and trimmed: past it the pull risks a visible kick
+            // up the shin on honest frames.
+            c.ground.snapZoneShinFraction = Swift.max(c.ground.snapZoneShinFraction, 0.08)
+            c.ground.ankleSnapBlend = Swift.max(c.ground.ankleSnapBlend, 0.65)
         }
         return c
     }
@@ -1036,12 +1223,14 @@ public final class PosePriorCorrector {
 
         var penetrations = 0
         var ankleAnchors = 0
+        var pivotPlants = Set<Int>()
 
         for space in [PoseSpace.norm, PoseSpace.world] {
             var bank = timeline.channels(space)
             guard let plane = estimateGroundPlane(bank, frameCount: timeline.frameCount, jointCount: timeline.jointCount) else { continue }
             let penetrationBar = c.penetrationToleranceShinFraction * plane.shin
             let minAnkleHeight = c.minAnkleHeightShinFraction * plane.shin
+            let liftBar = c.liftThresholdShinFraction * plane.shin
 
             let footSides: [(heel: Int, toe: Int, ankle: Int, level: Double, ankleLevel: Double?)] = [
                 (Landmarks.LEFT_HEEL, Landmarks.LEFT_FOOT_INDEX, Landmarks.LEFT_ANKLE,
@@ -1071,6 +1260,29 @@ public final class PosePriorCorrector {
                             penetrations += 1
                         }
                     }
+
+                    // Round four (R3) mirror: during a heel lift the toe's
+                    // tolerance is zero here too. The main stage writes
+                    // the toe at exact turf level on lift frames, and the
+                    // zero-phase smoothing between that stage and this
+                    // backstop can undershoot the corner it wrote, which
+                    // is the residual dragging toe on an otherwise planted
+                    // pivot. The lift test is recomputed here because it
+                    // is cheap: one heightAbove per side per frame. Only
+                    // an actual clamp counts (a toe already sitting on
+                    // the level moves nothing and adds nothing), so
+                    // run()'s own backstop call right after the main
+                    // stage never double-counts a plant.
+                    if c.toePivotPlant,
+                       bank.y[side.heel][i].isFinite, bank.y[side.toe][i].isFinite {
+                        let heelH = (side.level - bank.y[side.heel][i]) * plane.up
+                        let toeH = (side.level - bank.y[side.toe][i]) * plane.up
+                        if heelH > liftBar, toeH < 0 {
+                            bank.y[side.toe][i] = side.level
+                            pivotPlants.insert(i)
+                        }
+                    }
+
                     if bank.y[side.ankle][i].isFinite {
                         let h = (ankleFloor - bank.y[side.ankle][i]) * plane.up
                         if h < -penetrationBar {
@@ -1085,6 +1297,7 @@ public final class PosePriorCorrector {
 
         qc.groundPenetrationsClamped += penetrations
         qc.ankleGroundAnchors += ankleAnchors
+        qc.toePivotPlants += pivotPlants.count
     }
 
     // MARK: - Bone-length projection
@@ -1207,6 +1420,11 @@ public final class PosePriorCorrector {
       joint. Reseating the shoulder first lets the whole arm chain hang
       from a correct root, which is the kinematic-chain-integrity form
       the research brief asks for.
+
+      Round four adds the SYMMETRIC BRANCH (R2): a width conviction whose
+      dominance test names no side used to convict nobody, which is how
+      the face-on both-shoulders collapse survived. Those frames now get
+      a two-sided reseat at a softer blend; see section 2b below.
     */
     private func projectOccludedShoulders(_ timeline: inout PoseTimeline, qc: inout TrackingQC) {
         let c = config.shoulder
@@ -1302,6 +1520,10 @@ public final class PosePriorCorrector {
         // ---- 1b. Conviction: pose-invariant collapse detection -----------
 
         var convicted = [Int?](repeating: nil, count: n)
+        // Round four (R2): frames where the width conviction fired but the
+        // dominance test named no side. These get the symmetric reseat
+        // below instead of the one-sided machinery.
+        var symmetric = [Bool](repeating: false, count: n)
         if c.collapseGuardEnabled {
             for i in 0..<n {
                 guard vis(lh, i) >= c.anchorMinVisibility,
@@ -1332,9 +1554,16 @@ public final class PosePriorCorrector {
                     convicted[i] = ls
                 } else if deficitR > floorBar, deficitR >= c.collapseErrorDominance * Swift.max(deficitL, 0) {
                     convicted[i] = rs
+                } else {
+                    // Round four (R2): neither side dominant used to mean
+                    // nobody was convicted, and that shrug is exactly how
+                    // the face-on black-shirt failure survived every
+                    // round: BOTH shoulders collapse toward the trapezius,
+                    // the width crush convicts the frame, and the
+                    // dominance test finds no one to blame. The frame is
+                    // now marked for the symmetric reseat below.
+                    symmetric[i] = true
                 }
-                // Neither side dominant: a genuinely bad frame convicts
-                // nobody; the torso ratio stage and the smoothing own it.
             }
         }
 
@@ -1346,6 +1575,19 @@ public final class PosePriorCorrector {
         // spheres cannot meet (degraded data), alternate projections onto
         // the two constraints, which lands on the nearest feasible
         // compromise. Everything in world units, mirrored into norm below.
+
+        // The per-frame world-to-norm scale bridge for mirroring a world
+        // move into the normalised set: this frame's own hip width in each
+        // space, the same bridge the GMM stage uses. Nil when either space
+        // cannot measure its hips this frame, in which case the norm set
+        // is left alone rather than guessed at. Shared by the one-sided
+        // reseat and the round-four symmetric branch.
+        func hipWidthScale(_ i: Int) -> Double? {
+            guard let a = w3(lh, i), let b = w3(rh, i) else { return nil }
+            let d = dist3(a, b)
+            guard d > 1e-6, let hwNorm = normPlanarDist(lh, rh, i) else { return nil }
+            return hwNorm / d
+        }
 
         func reseatTarget(bad: Vec3, good: Vec3, hip: Vec3, r: Double, w: Double) -> Vec3 {
             let nx = good.x - hip.x, ny = good.y - hip.y, nz = (good.z ?? 0) - (hip.z ?? 0)
@@ -1395,7 +1637,12 @@ public final class PosePriorCorrector {
         for (occl, anchor) in [(ls, rs), (rs, ls)] {
             for i in 0..<n {
                 let convictedHere = convicted[i] == occl
-                guard vis(occl, i) < c.occludedBelow || convictedHere,
+                      // A symmetric-collapse frame is owned by its own
+                      // branch below; running the one-sided path on it too
+                      // (a dim shoulder can coincide with a symmetric
+                      // conviction) would correct the same joint twice.
+                guard !symmetric[i],
+                      vis(occl, i) < c.occludedBelow || convictedHere,
                       // A convicted anchor cannot vouch for the other side
                       // this frame, whatever its visibility says.
                       convicted[i] != anchor,
@@ -1421,19 +1668,11 @@ public final class PosePriorCorrector {
                 }
 
                 // Mirror the planar part of the move into the normalised
-                // set, scaled by this frame's own hip width in each space,
-                // the same per-frame scale bridge the GMM stage uses, so
-                // the overlay and the 3D figure keep moving together. The
-                // norm z is left alone: it is a camera-relative estimate
-                // the reseat has no business inventing.
-                if timeline.norm.x[occl][i].isFinite,
-                   let hwWorld = { () -> Double? in
-                       guard let a = w3(lh, i), let b = w3(rh, i) else { return nil }
-                       let d = dist3(a, b)
-                       return d > 1e-6 ? d : nil
-                   }(),
-                   let hwNorm = normPlanarDist(lh, rh, i) {
-                    let s = hwNorm / hwWorld
+                // set through the hip-width bridge above, so the overlay
+                // and the 3D figure keep moving together. The norm z is
+                // left alone: it is a camera-relative estimate the reseat
+                // has no business inventing.
+                if timeline.norm.x[occl][i].isFinite, let s = hipWidthScale(i) {
                     timeline.norm.x[occl][i] += dx * s
                     timeline.norm.y[occl][i] += dy * s
                 }
@@ -1441,6 +1680,69 @@ public final class PosePriorCorrector {
                 correctedFrames.insert(i)
                 if convictedHere { collapseFrames.insert(i) }
             }
+        }
+
+        // ---- 2b. The symmetric reseat (round four, R2) -------------------
+        //
+        // Both shoulders collapsed and neither dominates, so the one-sided
+        // machinery has no trusted anchor shoulder to project from. The
+        // frame still carries three measured facts worth keeping: the hip
+        // centre, the bearing from it to the measured mid-shoulder point,
+        // and the measured shoulder-line direction. The reseat keeps all
+        // three and restores the two quantities the collapse crushed: the
+        // width returns to the clip median exactly, and the pair's stance
+        // from the hip centre returns to the level the two radius medians
+        // imply, by pushing the midpoint back out along its own measured
+        // bearing until the sum of squared radii matches the medians'
+        // (m below is that closed form). Each side's radius therefore
+        // moves toward its own median, with the remaining split between
+        // the two carried by the measured tilt of the shoulder line,
+        // which is honest signal. Blend 0.6, softer than the one-sided
+        // conviction's 0.85 (see the config note on
+        // symmetricCollapseBlend), then the same norm mirror through the
+        // hip-width bridge.
+        for i in 0..<n where symmetric[i] {
+            guard let l = w3(ls, i), let r = w3(rs, i), let hip = hipCentreW(i) else { continue }
+            let sepX = l.x - r.x, sepY = l.y - r.y, sepZ = (l.z ?? 0) - (r.z ?? 0)
+            let sep = (sepX * sepX + sepY * sepY + sepZ * sepZ).squareRoot()
+            let midX = (l.x + r.x) / 2, midY = (l.y + r.y) / 2
+            let midZ = ((l.z ?? 0) + (r.z ?? 0)) / 2
+            let bearX = midX - hip.x, bearY = midY - hip.y, bearZ = midZ - (hip.z ?? 0)
+            let bear = (bearX * bearX + bearY * bearY + bearZ * bearZ).squareRoot()
+            // Coincident shoulders have no line direction, and a midpoint
+            // sitting on the hip centre has no bearing; with no measured
+            // direction there is nothing honest to reseat along, and
+            // inventing one is the magnet's mistake this file removed.
+            guard sep > 1e-6, bear > 1e-6 else { continue }
+            let vx = sepX / sep, vy = sepY / sep, vz = sepZ / sep
+            let ux = bearX / bear, uy = bearY / bear, uz = bearZ / bear
+            let a = widthMedian / 2
+            let m = Swift.max(
+                (radiusLeft * radiusLeft + radiusRight * radiusRight) / 2 - a * a, 0
+            ).squareRoot()
+            let cx = hip.x + ux * m, cy = hip.y + uy * m, cz = (hip.z ?? 0) + uz * m
+
+            let blend = c.symmetricCollapseBlend
+            let targets: [(joint: Int, tx: Double, ty: Double, tz: Double, bad: Vec3)] = [
+                (ls, cx + vx * a, cy + vy * a, cz + vz * a, l),
+                (rs, cx - vx * a, cy - vy * a, cz - vz * a, r),
+            ]
+            for t in targets {
+                let dx = blend * (t.tx - t.bad.x)
+                let dy = blend * (t.ty - t.bad.y)
+                let dz = blend * (t.tz - (t.bad.z ?? 0))
+                timeline.world.x[t.joint][i] += dx
+                timeline.world.y[t.joint][i] += dy
+                if timeline.world.z[t.joint][i].isFinite {
+                    timeline.world.z[t.joint][i] += dz
+                }
+                if timeline.norm.x[t.joint][i].isFinite, let s = hipWidthScale(i) {
+                    timeline.norm.x[t.joint][i] += dx * s
+                    timeline.norm.y[t.joint][i] += dy * s
+                }
+            }
+            correctedFrames.insert(i)
+            collapseFrames.insert(i)
         }
 
         qc.shoulderProjectionFrames += correctedFrames.count
@@ -1722,6 +2024,7 @@ public final class PosePriorCorrector {
         var penetrations = 0
         var ankleAnchors = 0
         var liftLead = Set<Int>()
+        var pivotPlants = Set<Int>()
         var liftTrail = Set<Int>()
         var flattenedDepth = false
 
@@ -1916,8 +2219,33 @@ public final class PosePriorCorrector {
                     // Rule 3: a clearly lifted heel is a real event. Count
                     // it, per lead and trail, and touch nothing. Counted
                     // once per frame across spaces via the sets.
+                    //
+                    // Round four (R3), the toe pivot plant: during a heel
+                    // lift the toe is planted BY DEFINITION, that is what
+                    // a pivot is, and the audited toe-in-the-turf frames
+                    // are exactly these: the shoe wedge is steep there,
+                    // and the penetration tolerance that keeps plane
+                    // noise from flattening a planted foot was also
+                    // licensing about a centimetre of toe drag. So while
+                    // the heel is lifted, the toe loses that allowance:
+                    // tolerance goes to zero (any toe below turf writes
+                    // to level, no penetrationBar) and a toe hovering
+                    // within the snap zone snaps fully TO the level
+                    // rather than blending toward it. A toe clearly above
+                    // the zone is left alone: golf has no full-foot hop
+                    // mid swing, but if one is ever measured, the data
+                    // wins. Counted per frame into qc.toePivotPlants; the
+                    // lift counters are unchanged, so plants and lift
+                    // frames validate each other (same order of magnitude
+                    // on any clip with a real pivot).
                     if let h = heightAbove(side.heel, level: side.level), h > liftBar {
                         if side.isLeft == leadIsLeft { liftLead.insert(i) } else { liftTrail.insert(i) }
+                        if c.toePivotPlant,
+                           let ht = heightAbove(side.toe, level: side.level),
+                           ht <= snapZone {
+                            bank.y[side.toe][i] = side.level
+                            pivotPlants.insert(i)
+                        }
                     }
                 }
             }
@@ -1927,9 +2255,125 @@ public final class PosePriorCorrector {
         qc.groundPlaneSnaps += snaps
         qc.groundPenetrationsClamped += penetrations
         qc.ankleGroundAnchors += ankleAnchors
+        qc.toePivotPlants += pivotPlants.count
         qc.heelLiftFramesLead += liftLead.count
         qc.heelLiftFramesTrail += liftTrail.count
         if flattenedDepth { qc.footDepthFlattened = true }
+    }
+
+    // MARK: - Knee depth consistency (round four, R4)
+
+    private static let kneeChains: [(hip: Int, knee: Int, ankle: Int)] = [
+        (Landmarks.LEFT_HIP, Landmarks.LEFT_KNEE, Landmarks.LEFT_ANKLE),
+        (Landmarks.RIGHT_HIP, Landmarks.RIGHT_KNEE, Landmarks.RIGHT_ANKLE),
+    ]
+
+    /*
+      See KneeDepthConfig for the failure, the trigger and the philosophy.
+      Two passes per knee: detection reads the ORIGINAL offsets for the
+      whole clip, then the corrections are applied, so a run of flipped
+      frames cannot cascade through its own running median and the result
+      is independent of iteration order. The ankle appears in the chain
+      table only to build the shin yardstick; it is never written.
+    */
+    private func enforceKneeDepthConsistency(_ timeline: inout PoseTimeline, qc: inout TrackingQC) {
+        let c = config.kneeDepth
+        guard c.enabled, timeline.frameCount > 8 else { return }
+        let n = timeline.frameCount
+
+        // The world shin yardstick, 3D, pooled over both sides, the same
+        // golfer-relative scale every other threshold in this file uses in
+        // its own space. Depth folds in only where both ends carry it, the
+        // bone projection's rule.
+        var shins: [Double] = []
+        for chain in Self.kneeChains where max(chain.hip, chain.knee, chain.ankle) < timeline.jointCount {
+            for i in 0..<n {
+                let kx = timeline.world.x[chain.knee][i], ky = timeline.world.y[chain.knee][i]
+                let ax = timeline.world.x[chain.ankle][i], ay = timeline.world.y[chain.ankle][i]
+                guard kx.isFinite, ax.isFinite else { continue }
+                let kz = timeline.world.z[chain.knee][i], az = timeline.world.z[chain.ankle][i]
+                let dz = (kz.isFinite && az.isFinite) ? kz - az : 0
+                let dx = kx - ax, dy = ky - ay
+                let l = (dx * dx + dy * dy + dz * dz).squareRoot()
+                if l > 1e-6 { shins.append(l) }
+            }
+        }
+        guard shins.count > 8 else { return }
+        shins.sort()
+        let shin = shins[shins.count / 2]
+        guard shin > 1e-6 else { return }
+
+        let offsetFloor = c.minOffsetShinFraction * shin
+        let hipStepBar = c.hipStabilityStepFraction * shin
+        var corrections = 0
+
+        for chain in Self.kneeChains {
+            guard max(chain.hip, chain.knee) < timeline.jointCount else { continue }
+
+            // Pass 1: the original offsets, NaN where either z is absent.
+            // On a backend with no world depth (Vision) nothing here is
+            // ever finite, usable stays 0, and the stage is inert, the
+            // honest behaviour.
+            var offset = [Double](repeating: .nan, count: n)
+            var usable = 0
+            for i in 0..<n {
+                let kz = timeline.world.z[chain.knee][i]
+                let hz = timeline.world.z[chain.hip][i]
+                guard kz.isFinite, hz.isFinite else { continue }
+                offset[i] = kz - hz
+                usable += 1
+            }
+            guard usable > 8 else { continue }
+            let cap = Int(Double(usable) * c.maxFraction)
+
+            // The trigger's reference: a running median of the offset over
+            // the window, needing a majority of the window finite so a
+            // gap-riddled stretch cannot manufacture a reference.
+            func runningMedian(_ i: Int) -> Double? {
+                var window: [Double] = []
+                let lo = Swift.max(0, i - c.windowRadius)
+                let hi = Swift.min(n - 1, i + c.windowRadius)
+                for k in lo...hi where offset[k].isFinite { window.append(offset[k]) }
+                guard window.count >= 5 else { return nil }
+                window.sort()
+                return window[window.count / 2]
+            }
+            // Clause 2: the same-side hip's own depth must be holding
+            // still around this frame. If the hip z jumped too, the sign
+            // flip may be the hip's error, and correcting the knee against
+            // a bad hip would launder one joint's failure into another's.
+            func hipStepStable(_ i: Int) -> Bool {
+                let hz = timeline.world.z[chain.hip][i]
+                var sawNeighbour = false
+                for k in [i - 1, i + 1] where k >= 0 && k < n {
+                    let nz = timeline.world.z[chain.hip][k]
+                    guard nz.isFinite else { continue }
+                    sawNeighbour = true
+                    if abs(hz - nz) > hipStepBar { return false }
+                }
+                return sawNeighbour
+            }
+
+            // Pass 2: detect against the originals, correct in place.
+            var flipped = 0
+            for i in 0..<n {
+                guard flipped < cap else { break }
+                let off = offset[i]
+                guard off.isFinite, abs(off) >= offsetFloor else { continue }
+                guard let med = runningMedian(i), abs(med) > 1e-9,
+                      (off > 0) != (med > 0) else { continue }
+                guard hipStepStable(i) else { continue }
+                // Undo the mirror: negate the offset about the hip depth.
+                let hz = timeline.world.z[chain.hip][i]
+                let mirrored = hz - off
+                timeline.world.z[chain.knee][i] = Geometry.lerp(
+                    timeline.world.z[chain.knee][i], mirrored, c.blend
+                )
+                flipped += 1
+            }
+            corrections += flipped
+        }
+        qc.kneeDepthFlipsCorrected += corrections
     }
 
     // MARK: - Impossible folds
@@ -2011,6 +2455,11 @@ public final class PosePriorCorrector {
       bearing are image-plane statements per space, depth stays untouched,
       each space runs with its own medians and units, and frames are
       counted once into qc.gripClusterFrames however many spaces fired.
+
+      Round four adds the RIGID-HAND CARRY (R1): the wrist's correction is
+      applied identically to that side's held knuckles (index, pinky,
+      thumb), so the hand rides the wrist instead of kinking into the
+      audited V. Detailed at the pass 2 write loop below.
     */
     private func anchorGripCluster(_ timeline: inout PoseTimeline, qc: inout TrackingQC) {
         let c = config.gripCluster
@@ -2175,8 +2624,44 @@ public final class PosePriorCorrector {
                     let scale = ramp > 0
                         ? Swift.min(1, Double(k + 1) / Double(ramp + 1))
                         : 1
-                    bank.x[corr.joint][i] += corr.dx * scale
-                    bank.y[corr.joint][i] += corr.dy * scale
+                    let dx = corr.dx * scale
+                    let dy = corr.dy * scale
+                    bank.x[corr.joint][i] += dx
+                    bank.y[corr.joint][i] += dy
+
+                    /* Round four (R1), the rigid-hand carry. The anchor
+                       used to move the wrist alone, and the knuckles,
+                       held at the same stale spot by the same gap fill,
+                       stayed parked: the forearm to wrist to knuckle
+                       polyline kinked into the audited V, and the hand
+                       collapse guard could not object, because a wrist
+                       that LEFT its knuckles produces a LARGE span and
+                       that guard fires on a tiny one. So the hand now
+                       rides the wrist: the identical scaled delta, carry
+                       factor 1.0 (less would just reintroduce a
+                       proportional V, more would over-rotate the hand),
+                       written inside this same ramped write so the
+                       engagement stays a glide. Each knuckle is carried
+                       only when it is finite and its own visibility sits
+                       under the anchor bar, which is every hold and
+                       every bridge but never a confident measurement, so
+                       an honestly measured knuckle is never dragged. The
+                       crop pass runs before this anchor and restores a
+                       rescued hand's visibility to the crop's own, so a
+                       crop-rescued knuckle is not weak and the carry
+                       never fights it either. Same QC account as the
+                       wrist (gripClusterFrames): the carry is part of
+                       the same correction, not a new one. */
+                    let knuckles = corr.joint == lw
+                        ? [Landmarks.LEFT_INDEX, Landmarks.LEFT_PINKY, Landmarks.LEFT_THUMB]
+                        : [Landmarks.RIGHT_INDEX, Landmarks.RIGHT_PINKY, Landmarks.RIGHT_THUMB]
+                    for j in knuckles where j < timeline.jointCount
+                        && bank.x[j][i].isFinite && bank.y[j][i].isFinite
+                        && vis(j, i) < c.anchorMinVisibility {
+                        bank.x[j][i] += dx
+                        bank.y[j][i] += dy
+                    }
+
                     correctedFrames.insert(i)
                 }
             }

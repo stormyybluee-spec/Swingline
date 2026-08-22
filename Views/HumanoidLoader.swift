@@ -807,6 +807,36 @@ public final class HumanoidRig {
     private var markers: [MarkerID: SCNNode] = [:]
     private var markerMaterials: [MarkerID: SCNMaterial] = [:]
 
+    /*
+      Spine chain hysteresis (round four, R8). The chain gate in apply()
+      fails for a handful of frames at exactly maximum rotation, because
+      that is where a shoulder's confidence dips under the trust floor for
+      a moment, and the straight-stack fallback IS the plank the audits
+      flag, worn precisely on the most rotated frames. The pipeline is not
+      the fix; the render gate is. So the last successfully built chain's
+      four lateral axes are cached here, in scene space exactly as they
+      were handed to place(), and for up to spineRollHoldFrames of
+      CONSECUTIVE gate failures the fallback stack keeps rolling its
+      segments from the cache while its POSITIONS honestly fall back to
+      the straight lerp line: articulation persists, geometry never lies.
+      Past the hold, or when there was never a good chain, the shared-roll
+      plank returns, because a stale twist held through a genuine cut
+      would be its own artifact; 12 frames is 200 ms at the grid rate,
+      which covers the audited dips. The cache resets whenever the rig has
+      no world at all, so scrubbing across a gap re-enters cleanly:
+      apply() stays pure per frame plus this one small cache.
+    */
+    private struct SpineRollCache {
+        var pelvis: SIMD3<Float>
+        var lumbar: SIMD3<Float>
+        var thoracic: SIMD3<Float>
+        var cervical: SIMD3<Float>
+        /// Consecutive gate failures survived so far.
+        var age: Int
+    }
+    private var spineRollCache: SpineRollCache?
+    private static let spineRollHoldFrames = 12
+
     private let bodyNode = SCNNode()
     private let markerNode = SCNNode()
 
@@ -1079,6 +1109,10 @@ public final class HumanoidRig {
         defer { SCNTransaction.commit() }
 
         guard let world, !world.isEmpty else {
+            // Round four (R8): no world means no continuity to lean on, so
+            // the spine roll cache resets and scrubbing across a gap
+            // re-enters the hysteresis cleanly.
+            spineRollCache = nil
             hideAll()
             return
         }
@@ -1107,7 +1141,14 @@ public final class HumanoidRig {
            need, so the trust gate is pose.neck.ok and pose.pelvis.ok; when
            either fails, or the chain refuses to build, the original straight
            stack takes over and hides itself through the same gates as
-           before. The figure can lose articulation, never its torso. */
+           before. The figure can lose articulation, never its torso.
+
+           Round four (R8): the stack's ROLL now carries hysteresis. The
+           gate dips for a few frames at exactly maximum rotation, which
+           made the fallback plank appear on precisely the frames the X
+           factor matters most, so the fallback keeps the last good chain's
+           per-segment laterals for a short hold before reverting to the
+           shared roll. See SpineRollCache above the class members. */
         var spineChainConfig = SpineChain.Config()
         spineChainConfig.lumbarHeightFraction = 0.28
         spineChainConfig.thoracicHeightFraction = 0.54
@@ -1137,15 +1178,43 @@ public final class HumanoidRig {
             place(.pelvisBlock, from: lumbarP, to: pelvisP,
                   roll: scene(chain.pelvis.lateral),
                   cross: SIMD2(s.pelvisWidth, s.pelvisDepth), lengthGain: 1.55)
+            /* Round four (R8): remember this chain's roll references, in
+               scene space exactly as place() just received them, so a
+               short gate dip on the next frames can keep the articulation
+               alive. Age zero: the cache is fresh. */
+            spineRollCache = SpineRollCache(
+                pelvis: scene(chain.pelvis.lateral),
+                lumbar: scene(chain.lumbar.lateral),
+                thoracic: scene(chain.thoracic.lateral),
+                cervical: scene(chain.cervical.lateral),
+                age: 0
+            )
             spineDrawn = true
         }
         if !spineDrawn {
-            place(.chest, from: pose.neck, to: pose.chestLow, roll: lateral,
-                  cross: SIMD2(s.chestWidth, s.chestDepth), lengthGain: 1.14)
-            place(.abdomen, from: pose.chestLow, to: pose.abdomen, roll: lateral,
-                  cross: SIMD2(s.abdomenWidth, s.abdomenDepth), lengthGain: 1.30)
-            place(.pelvisBlock, from: pose.abdomen, to: pose.pelvis, roll: lateral,
-                  cross: SIMD2(s.pelvisWidth, s.pelvisDepth), lengthGain: 1.55)
+            /* Round four (R8): the hysteresis. See the SpineRollCache note.
+               Positions below are the honest straight-stack lerps in BOTH
+               branches; only the roll differs, cached per segment for a
+               short dip, shared plank past the hold or when no good chain
+               has been seen yet. */
+            if var cache = spineRollCache, cache.age < Self.spineRollHoldFrames {
+                cache.age += 1
+                spineRollCache = cache
+                place(.chest, from: pose.neck, to: pose.chestLow, roll: cache.cervical,
+                      cross: SIMD2(s.chestWidth, s.chestDepth), lengthGain: 1.14)
+                place(.abdomen, from: pose.chestLow, to: pose.abdomen, roll: cache.thoracic,
+                      cross: SIMD2(s.abdomenWidth, s.abdomenDepth), lengthGain: 1.30)
+                place(.pelvisBlock, from: pose.abdomen, to: pose.pelvis, roll: cache.pelvis,
+                      cross: SIMD2(s.pelvisWidth, s.pelvisDepth), lengthGain: 1.55)
+            } else {
+                spineRollCache = nil
+                place(.chest, from: pose.neck, to: pose.chestLow, roll: lateral,
+                      cross: SIMD2(s.chestWidth, s.chestDepth), lengthGain: 1.14)
+                place(.abdomen, from: pose.chestLow, to: pose.abdomen, roll: lateral,
+                      cross: SIMD2(s.abdomenWidth, s.abdomenDepth), lengthGain: 1.30)
+                place(.pelvisBlock, from: pose.abdomen, to: pose.pelvis, roll: lateral,
+                      cross: SIMD2(s.pelvisWidth, s.pelvisDepth), lengthGain: 1.55)
+            }
         }
 
         /* Neck and head hang off the shoulder midpoint toward the head point.

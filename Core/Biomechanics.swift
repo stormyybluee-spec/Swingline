@@ -96,6 +96,21 @@ public enum Biomechanics {
     }
 
     public static func buildSeries(_ frames: [Frame], _ dominantHand: DominantHand = .right) -> SwingSeries {
+        buildSeries(frames, dominantHand, view: nil)
+    }
+
+    /*
+      Round four view plumbing (verdict 20). The orchestrator classifies the
+      clip's camera view once, after cleanup, and threads it everywhere; this
+      entry point receives it so the flip guard below can use the bar the
+      view earns. Nil means "no view known" and keeps the 120 degree bar, so
+      the safe default is exactly today's behaviour and a caller that lags a
+      commit changes nothing. Internal, not public, because SwingView itself
+      is declared internal (MediaPipePoseProvider.swift) and the public
+      two-argument entry above stays for every existing caller; `view`
+      carries no default so the two can never be ambiguous at a call site.
+    */
+    static func buildSeries(_ frames: [Frame], _ dominantHand: DominantHand = .right, view: SwingView?) -> SwingSeries {
         let S = Landmarks.sides(dominantHand)
         let n = frames.count
         let t = frames.map { $0.t }
@@ -143,9 +158,19 @@ public enum Biomechanics {
         var prevShoulderDir: Vec3? = nil
         var flipCount = 0
 
+        /* Round four (verdict 20): the bar is view aware. Filmed face on,
+           the transverse angle is at its cleanest and a real pelvis still
+           cannot turn 90 degrees in one frame at any rate this app runs at,
+           so 90 catches the swaps 120 lets through. It stays 120 down the
+           line, and when no view is known, because profile foreshortening
+           makes the transverse angle itself noisier there and 90 would
+           misfire on honest frames. flipCount semantics are unchanged: the
+           counter still means "frames where a line had to be negated". */
+        let deflipBar: Double = view == .faceOn ? 90 : 120
+
         func deflip(_ line: Vec3, _ prev: Vec3?) -> (line: Vec3, flipped: Bool) {
             guard let prev = prev else { return (line, false) }
-            if Geometry.angleBetween(line, prev) > 120 { return (Geometry.v.scale(line, -1), true) }
+            if Geometry.angleBetween(line, prev) > deflipBar { return (Geometry.v.scale(line, -1), true) }
             return (line, false)
         }
 

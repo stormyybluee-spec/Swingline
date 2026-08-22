@@ -391,6 +391,7 @@ enum UploadProcessor {
         // below reads the lead wrist straight from them.
         let corrector = PosePriorCorrector.analytic(dominantHand: dominantHand)
         corrector.run(&timeline, qc: &qc)
+        corrector.enforceGroundBackstop(&timeline, qc: &qc)
         progress(0.90)
 
         let refined = timeline.frames()

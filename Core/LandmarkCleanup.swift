@@ -95,6 +95,30 @@ public struct CleanupConfig {
     public var boneTolerance: Double = 0.08
     public var boneMadFactor: Double = 3.0
 
+    /*
+      Bone impossibility floor (round four, R5a). The proportional test
+      above adapts its threshold to the clip's own wobble, which is right
+      for jitter and wrong for catastrophe: on the audited face-on frames
+      the occluded upper arm collapses to near zero length, those frames
+      corrupt the surviving-length pool, the adaptive threshold inflates,
+      and the very samples the check exists for sail through it. World
+      space is metric, not projected, so no camera foreshortening can make
+      a real limb bone measure under about half its own clip median: below
+      the fraction here the sample is anatomically impossible, full stop,
+      and no confidence figure or adaptive tolerance can excuse it. The
+      per-bone cap keeps a clip whose median is itself corrupt from
+      self-destructing; a capped-out clip degrades to flagged rather than
+      starved, the same philosophy as the wrist valve above.
+    */
+    public var boneImpossibilityFloor: Bool = true
+    /// A limb bone under this fraction of its clip median is impossible.
+    /// 0.45: above 0.5 starts colliding with real crop-merge jitter, below
+    /// 0.4 misses the audited elbow-on-shoulder frames.
+    public var boneImpossibleFraction: Double = 0.45
+    /// Per-clip sanity cap: at most this fraction of a bone's measured
+    /// samples can be rejected by the floor.
+    public var boneImpossibleMaxFraction: Double = 0.3
+
     /// E-lite. Elbow-angle rate limit in degrees per second; a wrist whose
     /// implied elbow angle spikes past this and snaps back is rejected.
     public var elbowAngleRateLimit: Double = 900
@@ -177,7 +201,125 @@ public struct CleanupConfig {
     /// hollowing the clip into one long hold.
     public var wristRejectionMaxFraction: Double = 0.35
 
+    /*
+      Arm identity rejection (round four, R5b and R5c). The face-on audit's
+      worst frames are not noise but mistaken identity: the occluded side's
+      wrist reported sitting ON the other arm, the elbow cross-linked onto
+      the other tricep, all at confident-looking positions no geometric
+      smoother can repair.
+
+      The naive predicate, "reject the left wrist when it is nearer the
+      right elbow than the left elbow", is WRONG for golf: with two hands
+      on one grip, dist(leadWrist, trailElbow) is comparable to
+      dist(leadWrist, leadElbow) for most of a normal swing, so the naive
+      test convicts the gripped pose it exists to protect. The golf-aware
+      wrist predicate therefore requires ALL of: (1) the cross distance
+      under a STRICT fraction of the own-forearm distance, strict because
+      at a normal grip the two are comparable and only a wrist genuinely
+      sitting on the other arm gets this close; (2) the own forearm length
+      that frame outside the bone tolerance band, so the chain is already
+      demonstrably broken; and (3) visibility under the bar here, so a
+      hard-confident sample is left for the impossibility floor to judge
+      rather than second-guessed on geometry alone. The wrist is rejected,
+      never the elbow it was measured against: the wrist is the distal,
+      replaceable end.
+
+      The elbow mirror (R5c) convicts a cross-linked elbow the same way:
+      distance to the OTHER side's upper-arm segment under a fraction of
+      an upper-arm length, while this side's own shoulder-elbow-wrist
+      chain length that frame exceeds its clip median by the excess factor
+      (a real elbow cannot both touch the other tricep and keep its own
+      chain plausible), and visibility under the same bar.
+
+      On the Vision backend visibility is NaN, NaN reads trusted (the
+      house convention), condition (3) never holds, and the stage is
+      inert, which is honest. Both rejections are capped per joint per
+      clip and counted, the round-one valve philosophy: a catastrophic
+      clip degrades to flagged-and-partially-corrected, never to a
+      starved timeline. The required NEGATIVE validation is on healthy
+      clips: a clean gripped swing of either view must keep this counter
+      at or near zero, because a rejection stage that fires on healthy
+      data is worse than the disease.
+    */
+    public struct ArmIdentityConfig {
+        public var enabled: Bool = true
+        /// R5b condition 1: reject only when the wrist's distance to the
+        /// OTHER elbow is under this fraction of its distance to its OWN
+        /// elbow. 0.6 is deliberately strict; see the note above.
+        public var wristCrossFactor: Double = 0.6
+        /// R5c condition 1: elbow-to-other-upper-arm-segment distance bar,
+        /// as a fraction of the other side's median upper-arm length (the
+        /// median, not the frame length, because the frame the elbow is
+        /// misreported in is exactly the frame lengths cannot be trusted).
+        public var elbowSegmentFraction: Double = 0.25
+        /// R5c condition 2: this side's shoulder-elbow-wrist chain length
+        /// that frame must exceed its own clip median by this factor.
+        public var elbowChainExcessFactor: Double = 1.5
+        /// Condition 3 on both predicates: only samples the tracker itself
+        /// was unsure of are eligible. NaN visibility reads trusted.
+        public var maxVisibility: Double = 0.75
+        /// Per-clip cap, per joint (each wrist, each elbow, separately).
+        public var maxFractionPerJoint: Double = 0.15
+        public init() {}
+    }
+    public var armIdentity = ArmIdentityConfig()
+
+    /*
+      Background palm-lock rejection (round four, R7). The face-on audit's
+      white-hat failure: a knuckle jumps to a high-contrast background
+      object and STAYS there, so the velocity-spike check above catches at
+      most the single jump frame and the parked position then reads as
+      perfectly stable. The onset signature is the step ratio (a knuckle
+      step far past its own median while the wrist barely moved), but that
+      alone is incomplete: a hand rolling over a stationary wrist at the
+      finish can hit the same ratio legitimately. The completing condition
+      is span: a background object is not at hand distance, so the
+      rejection also requires the wrist-to-knuckle span to exceed its own
+      clip-median band, which a finish roll never does because a rolling
+      hand keeps hand-length span. Once a lock onset is convicted, the
+      rejection persists for the following frames while the span stays
+      past the band (that is the "stays there"), and releases the moment
+      the span comes home. Capped per knuckle per clip, counted, and run
+      BEFORE the hand collapse rejection below so a locked knuckle cannot
+      pollute the collapse statistics.
+    */
+    public struct BackgroundLockConfig {
+        public var enabled: Bool = true
+        /// Onset: knuckle step over this factor of its own clip-median step.
+        public var knuckleStepRatio: Double = 3.0
+        /// Onset: wrist step under this factor of its own clip-median step.
+        public var wristQuietRatio: Double = 0.5
+        /// Onset and persistence: wrist-to-knuckle span over this factor of
+        /// its clip median.
+        public var spanFactor: Double = 1.6
+        /// Per-clip cap, per knuckle.
+        public var maxFractionPerKnuckle: Double = 0.15
+        public init() {}
+    }
+    public var backgroundLock = BackgroundLockConfig()
+
     public init() {}
+
+    /*
+      View routing stub (round four, verdict 13). One factory pattern
+      everywhere: PosePrior routes through profiled(_:for:), the RTS
+      smoother and the scheduled Butterworth through their own forView
+      factories, and cleanup through this one. It currently returns the
+      base unchanged ON PURPOSE: the only per-view cleanup delta proposed
+      this round, wristVisibilityFloor 0.50 on face-on, was rejected
+      because the adaptive valve above already relaxes the bar on hazy
+      clips, and lowering it globally per view would KEEP more confidently
+      wrong samples, the exact opposite of what the face-on audit needs.
+      The stub exists so the next view-specific cleanup delta has a home
+      and so that decision reads as made, not missed.
+
+      Internal, not public, because SwingView itself is declared internal
+      (MediaPipePoseProvider.swift) and a method cannot be more visible
+      than the types in its signature.
+    */
+    static func forView(_ view: SwingView?, base: CleanupConfig = CleanupConfig()) -> CleanupConfig {
+        base
+    }
 }
 
 public final class LandmarkCleanupEngine {
@@ -296,14 +438,52 @@ public final class LandmarkCleanupEngine {
         }
 
         // ---- 3. Bone-length breaks (M-rules, world space only) -----------
+        //
+        // Round four: the stage now carries the impossibility floor (R5a),
+        // counted separately so the audit clips can show whether the old
+        // proportional path or the new floor fires. See the config note.
+        //
+        // NOTE FOR TrackingQC: add `public var boneImpossibleRejections:
+        // Int = 0` alongside outliersRejected. (Done in TrackingQC.swift,
+        // round four section.)
 
         for bone in Self.checkedBones {
             guard bone.a < joints, bone.b < joints,
                   aliveWorld[bone.a], aliveWorld[bone.b] else { continue }
-            outliers += flagBoneBreaks(
+            let broken = flagBoneBreaks(
                 timeline: timeline, a: bone.a, b: bone.b,
                 vis: vis, missing: &missing
             )
+            outliers += broken.flagged
+            qc.boneImpossibleRejections += broken.viaFloor
+        }
+
+        // ---- 3b. Arm identity rejection (round four, R5b and R5c) --------
+        //
+        // The face-on catastrophe the audits show is not noise, it is
+        // mistaken identity: an occluded side's wrist reported ON the other
+        // arm, an elbow cross-linked onto the other tricep, all at
+        // plausible-looking positions. Identity errors deserve rejection,
+        // not correction, which is why this lives here and not in the fold
+        // guard: a sample that belongs to the wrong limb carries no
+        // information about the right one, and under this engine's ONE
+        // RULE the honest move is to refuse it and let the fill bridge.
+        // The predicate is golf aware on purpose; see the config note for
+        // why the naive nearest-elbow test would convict every gripped
+        // pose it exists to protect. Runs after the bone stage so the
+        // forearm band it consults reflects the same statistics the bone
+        // checks just judged, and before the arm-geometry stage so E-lite
+        // reasons about wrists that at least belong to their own arm.
+        //
+        // NOTE FOR TrackingQC: add `public var armIdentityRejections: Int
+        // = 0` alongside outliersRejected. (Done in TrackingQC.swift,
+        // round four section.)
+        if config.armIdentity.enabled {
+            let identity = flagArmIdentity(
+                timeline: timeline, vis: vis, missing: &missing
+            )
+            outliers += identity
+            qc.armIdentityRejections += identity
         }
 
         // ---- 4. Arm-geometry breaks (E-lite, image space preferred) ------
@@ -319,7 +499,34 @@ public final class LandmarkCleanupEngine {
             )
         }
 
-        // ---- 4b. Hand collapse rejection (kinematic guard, Video 1) ------
+        // ---- 4b. Background palm-lock rejection (round four, R7) ---------
+        //
+        // See the CleanupConfig note for the white-hat failure, the onset
+        // signature and why the span clause is what makes a finish roll
+        // safe. Runs BEFORE the hand collapse rejection below so a knuckle
+        // parked on a background object cannot pollute the collapse
+        // statistics that stage judges its own frames against.
+        //
+        // NOTE FOR TrackingQC: add `public var backgroundLockRejections:
+        // Int = 0` alongside outliersRejected. (Done in TrackingQC.swift,
+        // round four section.)
+        if config.backgroundLock.enabled {
+            for hand in Self.hands {
+                guard hand.pinky < joints, hand.index < joints, hand.wrist < joints else { continue }
+                for knuckle in [hand.index, hand.pinky] {
+                    let locked = flagBackgroundLock(
+                        timeline: timeline,
+                        wrist: hand.wrist, knuckle: knuckle,
+                        aliveNorm: aliveNorm,
+                        missing: &missing
+                    )
+                    outliers += locked
+                    qc.backgroundLockRejections += locked
+                }
+            }
+        }
+
+        // ---- 4c. Hand collapse rejection (kinematic guard, Video 1) ------
         //
         // See the CleanupConfig note for the failure signature and why
         // rejection is the honest form here. Counted into the outlier
@@ -344,7 +551,7 @@ public final class LandmarkCleanupEngine {
             }
         }
 
-        // ---- 4c. Wrist occlusion rejection (occlusion overhaul) ----------
+        // ---- 4d. Wrist occlusion rejection (occlusion overhaul) ----------
         //
         // See the CleanupConfig note for the failure and header correction
         // 3 for the adaptive bar. Runs LAST among the rejections so the
@@ -492,10 +699,13 @@ public final class LandmarkCleanupEngine {
 
     // MARK: - Bone breaks
 
+    /// Returns what was newly flagged in total, and the subset the
+    /// impossibility floor alone caught (frames the proportional test
+    /// excused), so QC can show which path fired on a given clip.
     private func flagBoneBreaks(
         timeline: PoseTimeline, a: Int, b: Int,
         vis: (Int, Int) -> Double, missing: inout [[Bool]]
-    ) -> Int {
+    ) -> (flagged: Int, viaFloor: Int) {
         let n = timeline.frameCount
         let wx = timeline.world.x, wy = timeline.world.y, wz = timeline.world.z
 
@@ -511,11 +721,11 @@ public final class LandmarkCleanupEngine {
         for i in 0..<n {
             if let l = length(i), l > 1e-6 { lengths.append((i, l)) }
         }
-        guard lengths.count > 8 else { return 0 }
+        guard lengths.count > 8 else { return (0, 0) }
 
         let sorted = lengths.map { $0.len }.sorted()
         let median = sorted[sorted.count / 2]
-        guard median > 1e-6 else { return 0 }
+        guard median > 1e-6 else { return (0, 0) }
 
         // Relative deviation per frame, and its own robust spread, so the
         // eight percent floor adapts upward on clips that wobble as a
@@ -536,7 +746,24 @@ public final class LandmarkCleanupEngine {
         ]
 
         var flagged = 0
-        for (k, entry) in lengths.enumerated() where rel[k] > threshold {
+        var floorFlagged = 0
+        // The floor's cap is measured against the bone's own measured
+        // samples, the pool this stage judges: a clip whose median is
+        // corrupt cannot be hollowed past this by the floor alone.
+        let floorCap = Int(Double(lengths.count) * config.boneImpossibleMaxFraction)
+        for (k, entry) in lengths.enumerated() {
+            let broken = rel[k] > threshold
+            // Round four impossibility floor (R5a, see the config note): an
+            // unconditional rejection under the impossible fraction of the
+            // clip median, exempt from the adaptive tolerance above, so a
+            // collapse window that corrupted the tolerance pool cannot also
+            // hide behind it. Only attributed to the floor when the
+            // proportional test excused the frame, so the two paths stay
+            // distinguishable in QC.
+            let impossible = config.boneImpossibilityFloor
+                && entry.len < config.boneImpossibleFraction * median
+            let viaFloor = !broken && impossible && floorFlagged < floorCap
+            guard broken || viaFloor else { continue }
             // Reject the less trusted endpoint; distal when trust is equal or
             // unknown, since errors accumulate outward from the torso.
             let va = vis(a, entry.i), vb = vis(b, entry.i)
@@ -549,6 +776,145 @@ public final class LandmarkCleanupEngine {
             if !missing[target][entry.i] {
                 missing[target][entry.i] = true
                 flagged += 1
+                if viaFloor { floorFlagged += 1 }
+            }
+        }
+        return (flagged, floorFlagged)
+    }
+
+    // MARK: - Arm identity rejection (round four, R5b and R5c)
+
+    /*
+      See the CleanupConfig note for the failure, the golf-aware predicate
+      and why the naive nearest-elbow test is wrong for a gripped pose.
+      World space throughout: image-space proximity between the arms is a
+      legitimate product of foreshortening (a DTL view stacks them), while
+      a wrist metrically sitting on the other arm is a fact about
+      identity. z contributes to a distance only when finite at both ends,
+      the same convention as the bone checks. Returns the total newly
+      flagged across both sides and both joints.
+    */
+    private func flagArmIdentity(
+        timeline: PoseTimeline,
+        vis: (Int, Int) -> Double,
+        missing: inout [[Bool]]
+    ) -> Int {
+        let joints = timeline.jointCount
+        let n = timeline.frameCount
+        guard n > 8 else { return 0 }
+        let armLeft = Self.arms[0]
+        let armRight = Self.arms[1]
+        let needed = [
+            armLeft.shoulder, armLeft.elbow, armLeft.wrist,
+            armRight.shoulder, armRight.elbow, armRight.wrist,
+        ]
+        guard needed.allSatisfy({ $0 < joints && timeline.jointIsAlive(.world, $0) })
+        else { return 0 }
+        let wx = timeline.world.x, wy = timeline.world.y, wz = timeline.world.z
+
+        func dist(_ a: Int, _ b: Int, _ i: Int) -> Double? {
+            guard wx[a][i].isFinite, wx[b][i].isFinite else { return nil }
+            let dx = wx[a][i] - wx[b][i]
+            let dy = wy[a][i] - wy[b][i]
+            let dz = (wz[a][i].isFinite && wz[b][i].isFinite) ? wz[a][i] - wz[b][i] : 0
+            return (dx * dx + dy * dy + dz * dz).squareRoot()
+        }
+
+        /// Distance from a joint to the segment between two others. Depth
+        /// joins in only when all three ends carry it, else the test runs
+        /// in the ground plane, the honest degradation.
+        func distToSegment(point p: Int, a: Int, b: Int, _ i: Int) -> Double? {
+            guard wx[p][i].isFinite, wx[a][i].isFinite, wx[b][i].isFinite else { return nil }
+            let useZ = wz[p][i].isFinite && wz[a][i].isFinite && wz[b][i].isFinite
+            let px = wx[p][i], py = wy[p][i], pz = useZ ? wz[p][i] : 0
+            let ax = wx[a][i], ay = wy[a][i], az = useZ ? wz[a][i] : 0
+            let bx = wx[b][i], by = wy[b][i], bz = useZ ? wz[b][i] : 0
+            let abx = bx - ax, aby = by - ay, abz = bz - az
+            let ab2 = abx * abx + aby * aby + abz * abz
+            var t = 0.0
+            if ab2 > 1e-12 {
+                t = ((px - ax) * abx + (py - ay) * aby + (pz - az) * abz) / ab2
+                t = Swift.min(1, Swift.max(0, t))
+            }
+            let cx = ax + t * abx - px
+            let cy = ay + t * aby - py
+            let cz = az + t * abz - pz
+            return (cx * cx + cy * cy + cz * cz).squareRoot()
+        }
+
+        /// Clip median and the same adaptive tolerance the bone checks use,
+        /// for one bone. Nil when the bone was too rarely measured to judge.
+        func band(_ a: Int, _ b: Int) -> (median: Double, threshold: Double)? {
+            var lens: [Double] = []
+            lens.reserveCapacity(n)
+            for i in 0..<n {
+                if let l = dist(a, b, i), l > 1e-6 { lens.append(l) }
+            }
+            guard lens.count > 8 else { return nil }
+            lens.sort()
+            let median = lens[lens.count / 2]
+            guard median > 1e-6 else { return nil }
+            let rel = lens.map { abs($0 - median) / median }.sorted()
+            let relMedian = rel[rel.count / 2]
+            let mad = rel.map { abs($0 - relMedian) }.sorted()[rel.count / 2]
+            return (median, Swift.max(config.boneTolerance, relMedian + config.boneMadFactor * mad))
+        }
+
+        /// Clip median of the shoulder-elbow-wrist chain length for a side.
+        func chainMedian(_ arm: (shoulder: Int, elbow: Int, wrist: Int)) -> Double? {
+            var lens: [Double] = []
+            lens.reserveCapacity(n)
+            for i in 0..<n {
+                guard let u = dist(arm.shoulder, arm.elbow, i),
+                      let f = dist(arm.elbow, arm.wrist, i) else { continue }
+                if u + f > 1e-6 { lens.append(u + f) }
+            }
+            guard lens.count > 8 else { return nil }
+            lens.sort()
+            return lens[lens.count / 2]
+        }
+
+        let cfg = config.armIdentity
+        let capPerJoint = Int(Double(n) * cfg.maxFractionPerJoint)
+        var flagged = 0
+
+        for (own, other) in [(armLeft, armRight), (armRight, armLeft)] {
+            let forearmBand = band(own.elbow, own.wrist)
+            let otherUpperMedian = band(other.shoulder, other.elbow)?.median
+            let ownChainMedian = chainMedian(own)
+
+            var wristFlags = 0
+            var elbowFlags = 0
+            for i in 0..<n {
+                // R5b: the wrist genuinely sitting on the other arm.
+                if wristFlags < capPerJoint, !missing[own.wrist][i],
+                   let forearm = forearmBand {
+                    let v = vis(own.wrist, i)
+                    if v.isFinite, v < cfg.maxVisibility,
+                       let dOwn = dist(own.wrist, own.elbow, i), dOwn > 1e-6,
+                       let dOther = dist(own.wrist, other.elbow, i),
+                       dOther < cfg.wristCrossFactor * dOwn,
+                       abs(dOwn - forearm.median) / forearm.median > forearm.threshold {
+                        missing[own.wrist][i] = true
+                        wristFlags += 1
+                        flagged += 1
+                    }
+                }
+                // R5c: the elbow cross-linked onto the other upper arm.
+                if elbowFlags < capPerJoint, !missing[own.elbow][i],
+                   let otherUpper = otherUpperMedian, let chainMed = ownChainMedian {
+                    let v = vis(own.elbow, i)
+                    if v.isFinite, v < cfg.maxVisibility,
+                       let dSeg = distToSegment(point: own.elbow, a: other.shoulder, b: other.elbow, i),
+                       dSeg < cfg.elbowSegmentFraction * otherUpper,
+                       let u = dist(own.shoulder, own.elbow, i),
+                       let f = dist(own.elbow, own.wrist, i),
+                       u + f > cfg.elbowChainExcessFactor * chainMed {
+                        missing[own.elbow][i] = true
+                        elbowFlags += 1
+                        flagged += 1
+                    }
+                }
             }
         }
         return flagged
@@ -611,6 +977,108 @@ public final class LandmarkCleanupEngine {
         return flagged
     }
 
+    // MARK: - Background palm-lock rejection (round four, R7)
+
+    /*
+      One knuckle against its own wrist, one pass. Detection lives in image
+      space like the hand collapse below: a background object is an
+      image-space phenomenon, and both backends put hand points in the
+      normalised channel when they have them at all. Onset requires all
+      three clauses (knuckle step spike, quiet wrist, span past the band);
+      the lock then persists frame to frame on the span clause alone, which
+      is exactly the audited "jumps and STAYS": the parked frames have tiny
+      steps and would sail through any velocity test, but they cannot fake
+      a hand-length span. Release the moment the span comes home or the
+      knuckle stops being measured. On the Vision backend the knuckle slots
+      are dead and the stage is inert, the honest behaviour. Returns what
+      was newly flagged; the per-knuckle cap leaves the counter pinned at
+      its ceiling on a catastrophic clip rather than starving the timeline.
+    */
+    private func flagBackgroundLock(
+        timeline: PoseTimeline,
+        wrist: Int, knuckle: Int,
+        aliveNorm: [Bool],
+        missing: inout [[Bool]]
+    ) -> Int {
+        guard aliveNorm[wrist], aliveNorm[knuckle] else { return 0 }
+        let n = timeline.frameCount
+        guard n > 8 else { return 0 }
+        let nb = timeline.norm
+
+        func step(_ j: Int, _ i: Int) -> Double? {
+            guard nb.x[j][i].isFinite, nb.x[j][i - 1].isFinite else { return nil }
+            let dx = nb.x[j][i] - nb.x[j][i - 1]
+            let dy = nb.y[j][i] - nb.y[j][i - 1]
+            return (dx * dx + dy * dy).squareRoot()
+        }
+        func span(_ i: Int) -> Double? {
+            guard nb.x[wrist][i].isFinite, nb.x[knuckle][i].isFinite else { return nil }
+            let dx = nb.x[wrist][i] - nb.x[knuckle][i]
+            let dy = nb.y[wrist][i] - nb.y[knuckle][i]
+            return (dx * dx + dy * dy).squareRoot()
+        }
+        func median(_ values: [Double]) -> Double? {
+            guard values.count > 8 else { return nil }
+            let s = values.sorted()
+            return s[s.count / 2]
+        }
+
+        var knuckleSteps: [Double] = []
+        var wristSteps: [Double] = []
+        var spans: [Double] = []
+        knuckleSteps.reserveCapacity(n)
+        wristSteps.reserveCapacity(n)
+        spans.reserveCapacity(n)
+        for i in 1..<n {
+            if let s = step(knuckle, i) { knuckleSteps.append(s) }
+            if let s = step(wrist, i) { wristSteps.append(s) }
+        }
+        for i in 0..<n {
+            if let s = span(i) { spans.append(s) }
+        }
+        guard let knuckleMedianStep = median(knuckleSteps), knuckleMedianStep > 1e-9,
+              let wristMedianStep = median(wristSteps), wristMedianStep > 1e-9,
+              let spanMedian = median(spans), spanMedian > 1e-9
+        else { return 0 }
+
+        let cfg = config.backgroundLock
+        let spanBar = cfg.spanFactor * spanMedian
+        let cap = Int(Double(n) * cfg.maxFractionPerKnuckle)
+
+        var flagged = 0
+        var locked = false
+        for i in 1..<n {
+            if flagged >= cap { break }
+            guard let d = span(i) else {
+                // The knuckle stopped being measured; whatever happens next
+                // is the fill's problem, not a lock.
+                locked = false
+                continue
+            }
+            if locked {
+                if d > spanBar {
+                    if !missing[knuckle][i] {
+                        missing[knuckle][i] = true
+                        flagged += 1
+                    }
+                } else {
+                    locked = false
+                }
+            } else {
+                guard d > spanBar,
+                      let ks = step(knuckle, i), ks > cfg.knuckleStepRatio * knuckleMedianStep,
+                      let ws = step(wrist, i), ws < cfg.wristQuietRatio * wristMedianStep
+                else { continue }
+                if !missing[knuckle][i] {
+                    missing[knuckle][i] = true
+                    flagged += 1
+                }
+                locked = true
+            }
+        }
+        return flagged
+    }
+
     // MARK: - Hand collapse rejection (kinematic guard, Video 1)
 
     /*
@@ -652,6 +1120,13 @@ public final class LandmarkCleanupEngine {
         var spans: [Double] = []
         spans.reserveCapacity(n)
         for i in 0..<n {
+            // Round four: samples an earlier rejection already refused (the
+            // background palm lock in particular, which runs immediately
+            // before this stage precisely so a knuckle parked on a
+            // background object cannot pollute these statistics) are not
+            // measurements of the hand and stay out of the median.
+            guard !missing[hand.wrist][i], !missing[hand.index][i], !missing[hand.pinky][i]
+            else { continue }
             if let d = handSpan(i) { spans.append(d) }
         }
         guard spans.count > 8 else { return 0 }

@@ -44,6 +44,12 @@
 //  stage's ankle anchor and foot depth flattening. Zero and false defaults
 //  throughout, same decode guarantee as every section above.
 //
+//  ROUND FOUR ADDITIONS (DTL + face-on overhaul). Six fields, nothing
+//  removed: the toe pivot plant, the knee depth-consistency stage, the arm
+//  identity rejection, the background palm-lock rejection, the bone
+//  impossibility floor, and the routed view label. Zero and empty defaults
+//  throughout, same decode guarantee as every section above.
+//
 //  Codable so it can ride on UploadProcessor.Result, be logged to disk, and
 //  eventually be persisted with the record if a schema bump wants it.
 //
@@ -257,6 +263,44 @@ public struct TrackingQC: Codable, Hashable {
     /// heel lift, detected and respected rather than fought.
     public var heelLiftFramesLead: Int = 0
     public var heelLiftFramesTrail: Int = 0
+
+    // MARK: - Round four: DTL + face-on overhaul
+
+    /// Frames where the toe pivot plant in the ground stage held a lifted
+    /// heel's toe at exact turf level (tolerance zero during the lift).
+    /// Should sit at the same order of magnitude as heelLiftFramesLead and
+    /// heelLiftFramesTrail on a clip with a real pivot; the pairing is the
+    /// stage validating itself.
+    public var toePivotPlants: Int = 0
+    /// Frames where the knee depth-consistency stage undid a mirrored knee
+    /// z (the sign of knee minus same-side-hip depth inverting in one frame
+    /// while the hip stayed put). Well under its 20 percent per-knee cap on
+    /// a healthy clip; pinned at the cap means the clip was flagged, not
+    /// rewritten.
+    public var kneeDepthFlipsCorrected: Int = 0
+    /// Wrist and elbow samples rejected by the arm identity checks in
+    /// LandmarkCleanup (a wrist genuinely sitting on the other arm, an
+    /// elbow cross-linked onto the other upper arm). Near zero on a healthy
+    /// clip of either view is the required negative result; the gripped
+    /// pose must never light this up.
+    public var armIdentityRejections: Int = 0
+    /// Knuckle samples rejected by the background palm-lock check in
+    /// LandmarkCleanup (a knuckle that jumped to a background object past
+    /// hand distance and parked there). Zero except on clips with the
+    /// audited white-hat style failure.
+    public var backgroundLockRejections: Int = 0
+    /// Limb bone samples rejected by the impossibility floor in
+    /// LandmarkCleanup: a per-frame length under the anatomically
+    /// impossible fraction of its own clip median, past what the
+    /// proportional tolerance could excuse. Separate from outliersRejected
+    /// attribution so the audit clips can show whether the old proportional
+    /// path or the new floor fired.
+    public var boneImpossibleRejections: Int = 0
+    /// The swing view the pipeline actually routed on ("faceOn",
+    /// "downTheLine"), whether preclassified by the orchestrator or
+    /// self-classified by the corrector. Empty when no view-aware stage
+    /// ran, this file's own "feature never ran" convention.
+    public var detectedViewLabel: String = ""
 
     // MARK: - Phases
 

@@ -168,15 +168,30 @@ public final class TemporalSmoothingService {
         /// gate otherwise. Off means the pass applies everywhere, which
         /// WILL soften impact and exists for experiments only.
         public var speedGated: Bool
+        /// Round four: optional per-joint kind resolution, so one pass can
+        /// polish the wrists lighter than the body (the face-on profile's
+        /// 0.5 wrist alpha against 0.35 elsewhere). Nil means the single
+        /// kind above rules every joint, so every existing caller compiles
+        /// and behaves exactly as before. Gating and direction stay shared:
+        /// only the kind varies per joint, because the gate is the schedule
+        /// and the schedule is one clip-wide fact.
+        public var kindForJoint: ((Int) -> Kind)?
 
         public init(
             kind: Kind = .ema(alpha: 0.35),
             bidirectional: Bool = true,
-            speedGated: Bool = true
+            speedGated: Bool = true,
+            kindForJoint: ((Int) -> Kind)? = nil
         ) {
             self.kind = kind
             self.bidirectional = bidirectional
             self.speedGated = speedGated
+            self.kindForJoint = kindForJoint
+        }
+
+        /// The kind that actually applies to this joint.
+        public func kind(for joint: Int) -> Kind {
+            kindForJoint?(joint) ?? kind
         }
     }
 
@@ -306,6 +321,80 @@ public final class TemporalSmoothingService {
         ))
     }
 
+    /*
+      ROUND FOUR VIEW ROUTING (R6b, verdict 18). The same scheduled factory,
+      plus the classified view. The public factory above is untouched and
+      keeps today's behaviour exactly; this overload is internal because
+      SwingView itself is declared internal (MediaPipePoseProvider.swift),
+      and `view` carries no default so the two factories can never be
+      ambiguous at a call site.
+
+      What the view changes, and only when it is .faceOn:
+
+      HIP BAND CEILING. Hips fall through to the default torso band, 4...8,
+      the lowest ceiling in the system, and a fast face-on pelvis rotation
+      through impact genuinely exceeds what 8 Hz preserves: that is the
+      audited hip marker lagging onto the lower femur. The ceiling rises to
+      11 for the two hips ONLY. Shoulders stay at 8 on purpose: their
+      high-frequency content at impact is mostly arm bleed-through, and the
+      shoulder stage upstream depends on stable shoulders. Going to 15
+      would let crossing-window wrist noise leak into the pelvis line that
+      every rotation metric reads. Note the backswing cap in buildSchedule
+      is deliberately NOT the lever here: it applies only before P4 and the
+      lag is at impact.
+
+      WRIST POLISH. The final pass, when the caller asked for one, resolves
+      to a lighter 0.5 EMA on the wrist set (0.35 default elsewhere). The
+      pass is speed gated, so this mostly shapes the release and finish,
+      which is exactly where the audit sees the lag tail; above 0.6 the
+      polish stops earning its place at address. Installed only when the
+      caller has not already resolved kinds per joint, so an explicit
+      kindForJoint always wins.
+
+      DTL and nil route everything to defaultBand and leave the pass alone:
+      a misclassified clip degrades to slightly different tuning, never to
+      different logic.
+    */
+    static func scheduled(
+        handSpeed: [Double],
+        times: [Double],
+        phases: PhaseResult?,
+        view: SwingView?,
+        adaptive: Bool = true,
+        finalPass: FinalPassConfig? = nil
+    ) -> TemporalSmoothingService {
+        var routedPass = finalPass
+        if view == .faceOn, var pass = routedPass, pass.kindForJoint == nil {
+            let baseKind = pass.kind
+            pass.kindForJoint = { joint in
+                Self.wristJoints.contains(joint) ? .ema(alpha: 0.5) : baseKind
+            }
+            routedPass = pass
+        }
+        return TemporalSmoothingService(config: Config(
+            cutoffForJoint: { joint in
+                // Fallback midpoint, used only if the schedule cannot build.
+                let band = Self.scheduledBand(for: joint, view: view)
+                return (band.lowerBound + band.upperBound) / 2
+            },
+            bandForJoint: { Self.scheduledBand(for: $0, view: view) },
+            scheduleSource: ScheduleSource(handSpeed: handSpeed, times: times, phases: phases),
+            adaptive: adaptive,
+            finalPass: routedPass
+        ))
+    }
+
+    /// The view-aware band table (round four), wrapping defaultBand. See
+    /// the routing note above for why the ceiling moves for the hips only
+    /// and only face-on. Internal for the SwingView reason above.
+    static func scheduledBand(for joint: Int, view: SwingView?) -> ClosedRange<Double> {
+        if view == .faceOn,
+           joint == Landmarks.LEFT_HIP || joint == Landmarks.RIGHT_HIP {
+            return 4...11
+        }
+        return defaultBand(for: joint)
+    }
+
     /// The band definitions from the header note. Public so QC and tests can
     /// state what the schedule actually spans.
     public static func defaultBand(for joint: Int) -> ClosedRange<Double> {
@@ -400,10 +489,15 @@ public final class TemporalSmoothingService {
                     } else {
                         gate = nil
                     }
-                    bank.x[joint] = finalPolish(bank.x[joint], fs: fs, gate: gate, config: fp)
-                    bank.y[joint] = finalPolish(bank.y[joint], fs: fs, gate: gate, config: fp)
+                    // Round four: the kind can resolve per joint (the
+                    // face-on wrist polish); the gate and direction stay
+                    // shared. See FinalPassConfig.kindForJoint.
+                    var fpJoint = fp
+                    fpJoint.kind = fp.kind(for: joint)
+                    bank.x[joint] = finalPolish(bank.x[joint], fs: fs, gate: gate, config: fpJoint)
+                    bank.y[joint] = finalPolish(bank.y[joint], fs: fs, gate: gate, config: fpJoint)
                     if bank.z[joint].allSatisfy({ $0.isFinite }) {
-                        bank.z[joint] = finalPolish(bank.z[joint], fs: fs, gate: gate, config: fp)
+                        bank.z[joint] = finalPolish(bank.z[joint], fs: fs, gate: gate, config: fpJoint)
                     }
                 }
                 // Visibility itself is never smoothed: it is metadata about
@@ -452,6 +546,12 @@ public final class TemporalSmoothingService {
                 // Backswing cap: firm smoothing before the top. The cap is on
                 // the weight, not the data, so a violently fast takeaway can
                 // still not push the backswing to the impact band.
+                //
+                // Round four record: raising this cap was proposed as the fix
+                // for the face-on hip lag and REJECTED, because the cap
+                // applies only before P4 and the audited lag is at impact.
+                // The actual lever is the hip band ceiling in scheduledBand.
+                // Recorded here so the next round does not re-propose it.
                 let cap: Double = t < p4t ? 0.35 : 1.0
                 // Downswing floor: full band from the transition through P8
                 // plus pad, then a 400 ms glide down to a mid-band hold, the
@@ -920,6 +1020,35 @@ public final class OcclusionRTSSmoother {
         public var occludedNoiseBoost: Double = 400
 
         public init() {}
+
+        /*
+          View factory (round four, R6a). Face-on hand crossings create
+          occlusion windows in the MIDDLE of the downswing, so this
+          smoother is active at the fastest instant of the clip, and the
+          default process noise, tuned for reconstructing the DTL's long
+          quiet holds, pulls the reconstructed wrist toward where it WILL
+          be: a zero-phase backward pass blends the future in, which is
+          the audited "projects forward into future frames". 80/500 lets
+          the model carry the several g a hand really pulls there, so the
+          window tracks instead of coasting; the ceiling is the point
+          where reconstructed windows would re-inherit the teleports the
+          smoother exists to remove. DTL and nil keep 50/300 exactly: DTL
+          occlusion windows are long holds where reconstruction, not
+          tracking, is the job. Measurement noise and the occluded boost
+          are deliberately untouched; the trust ramp is what shapes the
+          window, and it keeps doing so.
+
+          Internal because SwingView itself is declared internal
+          (MediaPipePoseProvider.swift).
+        */
+        static func forView(_ view: SwingView?) -> Config {
+            var config = Config()
+            if view == .faceOn {
+                config.processNoiseNorm = 80
+                config.processNoiseWorld = 500
+            }
+            return config
+        }
     }
 
     private let config: Config
