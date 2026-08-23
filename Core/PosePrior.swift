@@ -149,7 +149,55 @@
 //    view-aware stage in the pipeline consistently. The applied view is
 //    recorded in qc.detectedViewLabel.
 //
-//  ORDER OF OPERATIONS (conflict C3, amended by the skeleton overhaul)
+//  ROUND FIVE: ADVANCED SKELETON PASS. Three additions to this file, each
+//  detailed at its implementation site, plus the plumbing they ride on:
+//
+//    REFERENCE-BASED REASONING (P0). Every stage in this file measures the
+//    golfer's body constants as CLIP MEDIANS, and the stages' own comments
+//    admit the pools are polluted by the failures the stages exist to fix
+//    ("a collapsed frame with confident visibility does feed the pools").
+//    The address window is the one stretch of any clip where the tracker
+//    is at its most honest: the golfer is still, fully visible, nobody's
+//    arm crosses anybody's torso, and nothing is blurred. The orchestrator
+//    now captures that window as an AddressReference (CoreTypes) from the
+//    provisional hand speed and P1, and every body constant here (bone
+//    lengths, shoulder and hip widths and radii, the grip separation, the
+//    hand span, the turf and ankle levels) is resolved through ONE
+//    function, bodyConstant(_:), which prefers the reference median when
+//    the window carries enough confident samples AND agrees with the clip
+//    to within a sanity band, and falls back to the clip median otherwise.
+//    A clip that starts mid-takeaway, or whose address was badly tracked,
+//    therefore behaves exactly as before. Counted in
+//    qc.referenceConstantsUsed and qc.referenceConstantsRejected.
+//
+//    DAMPED LEAST SQUARES IK (P1). The sequential stages above each fix
+//    one thing and can undo each other (the bone projection moves a wrist
+//    the fold guard just placed; the torso stage rescales shoulders the
+//    reseat just positioned). SkeletonIKSolver, below, runs AFTER them as
+//    a single joint solve per frame: Levenberg-Marquardt over the twelve
+//    limb and torso joints in world space, minimising visibility-weighted
+//    fidelity to the measurements together with every constraint the file
+//    already trusts (the twelve rigid lengths, the four fold limits, the
+//    turf under the ankles), so the result satisfies all of them at once
+//    instead of whichever ran last. Trust-region capped per joint so it is
+//    a refinement of the corrected pose, never a redraw; mirrored into the
+//    normalised set through the same hip-width bridge the shoulder stage
+//    uses. Counted in qc.ikFramesSolved and qc.ikMeanResidualReduction.
+//
+//    HYPERGRAPH CONSISTENCY (P2). Two procedural passes over constraints
+//    that involve more than two joints at once, which no pairwise stage
+//    can express: the SPINE LENGTH hyperedge (both shoulders and both
+//    hips: the shoulder midpoint sits a fixed distance from the hip
+//    midpoint) and the BILATERAL SYMMETRY hyperedges (each left bone and
+//    its right twin: a golfer's two forearms are the same length, so when
+//    the two reference lengths disagree past tolerance the less seen side
+//    adopts the better seen one). The symmetry pass reconciles the body
+//    constants BEFORE the bone stage and the IK read them; the spine pass
+//    runs after the torso stage. Counted in qc.spineLengthCorrections and
+//    qc.bilateralSymmetryReconciled.
+//
+//  ORDER OF OPERATIONS (conflict C3, amended by the skeleton overhaul and
+//  round five)
 //
 //    0. view profile                  clip-level DTL versus face-on
 //                                     classification routes per-view
@@ -157,6 +205,14 @@
 //                                     (round four: the orchestrator may
 //                                     hand the classification in; nil
 //                                     self-classifies as before)
+//    0b. address reference            round five: the orchestrator may
+//                                     hand the address window in; the
+//                                     body constants below resolve
+//                                     through it
+//    0c. bilateral symmetry           round five hyperedge: left and
+//                                     right reference bone lengths are
+//                                     reconciled before anything reads
+//                                     them
 //    1. shoulder projection           FIRST, world-space rigid-body reseat
 //                                     (Fix S rebuilt, collapse guard on
 //                                     pose-invariant width and radius;
@@ -175,10 +231,14 @@
 //                                     (Fix 1), after the reseat so its
 //                                     symmetric scaling never splits a
 //                                     collapse error with the good side
-//    1c. bone-length projection       world space, pose-invariant lengths,
+//    1c. spine length                 round five hyperedge: shoulder
+//                                     midpoint held at its reference
+//                                     distance from the hip midpoint,
+//                                     both spaces
+//    1d. bone-length projection       world space, pose-invariant lengths,
 //                                     proximal to distal from corrected
 //                                     roots
-//    1d. knee depth consistency       world space, z channel only (round
+//    1e. knee depth consistency       world space, z channel only (round
 //                                     four, R4): a depth-mirrored knee is
 //                                     un-mirrored about its own hip depth
 //                                     BEFORE the fold guard, which would
@@ -211,6 +271,13 @@
 //                                     guard restores the golfer's own
 //                                     clip-median separation along the
 //                                     measured forearm direction.
+//    4. damped least squares IK       round five: one joint solve per
+//                                     frame over the limb and torso chain,
+//                                     world space with the norm mirror,
+//                                     trust-region capped, after every
+//                                     stage that repositions a joint and
+//                                     before the GMM so the prior scores a
+//                                     self-consistent skeleton
 //    5. GMM prior (Task 5)            norm space, mirrored to world, optional
 //    6. ground backstop               penetration clamps only, idempotent,
 //                                     run()'s own last word. UploadProcessor
@@ -625,6 +692,13 @@ public struct HandCollapseGuardConfig {
   blended on, clearly above it (a heel lift raises the ankle too) is left
   strictly alone. The turf-level penetration clamp remains as the hard
   backstop underneath.
+
+  ROUND FIVE, the address reference: at address both feet are flat and the
+  tracker is at its most honest, so the address-window median of the heel
+  and toe y IS the turf, with none of the percentile's exposure to sunk
+  outliers, and the address ankle median IS the ankle's resting level.
+  Both are resolved through bodyConstant(_:) against the clip percentile,
+  so a clip with no usable address window behaves exactly as before.
 */
 public struct GroundPlaneConfig {
     public var enabled: Bool = true
@@ -752,6 +826,118 @@ public struct KneeDepthConfig {
     /// The per-knee valve: corrections stop past this fraction of the
     /// knee's usable (finite-offset) frames.
     public var maxFraction: Double = 0.2
+    public init() {}
+}
+
+// MARK: - Address reference resolution (round five, P0)
+
+/*
+  How every body constant in this file is now read. See the file header for
+  why the address window is the cleanest data in any clip. The rule is one
+  function, bodyConstant(_:), and these are its knobs. The two guards exist
+  because a reference can be wrong in exactly two ways: too thin (a clip
+  that starts mid takeaway has a window of a handful of frames, and a
+  median of six samples is noise) or confidently mistaken (the stillness
+  test let a waggle or a second person through, and the window's median
+  disagrees with the whole clip). Either way the clip median is the safer
+  truth and the stage behaves exactly as it did before round five. Both
+  outcomes are counted so a clip where the reference was refused says so.
+*/
+public struct ReferenceResolutionConfig {
+    public var enabled: Bool = true
+    /// The window must carry at least this many confident samples of a
+    /// constant before its median is believed over the clip's.
+    public var minReferenceSamples: Int = 12
+    /// The reference median must sit within this relative band of the clip
+    /// median (for lengths, widths and spans). Wide on purpose: the clip
+    /// median is itself polluted, which is the whole reason the reference
+    /// exists, so the band only refuses a reference that is plainly not
+    /// the same golfer.
+    public var maxRelativeDisagreement: Double = 0.35
+    /// For levels (the turf, the ankle resting height), which have no
+    /// meaningful relative scale, the band is absolute, in shin lengths.
+    public var maxLevelDisagreementShinFraction: Double = 0.5
+    /// Weight of the reference in the resolved constant when both are
+    /// available. 1.0 takes the reference outright, the default, since the
+    /// window is the cleanest data in the clip; lower values split the
+    /// difference for diffing.
+    public var referenceWeight: Double = 1.0
+    public init() {}
+}
+
+// MARK: - Damped least squares IK (round five, P1)
+
+/*
+  The one joint solve per frame. See the file header for why it exists and
+  the stage's own note for the mechanics. Weights are in a common currency:
+  every residual is a relative, unitless quantity (metres of deviation over
+  the clip-median shin for fidelity, relative length deviation for the
+  rigid constraints, degrees past the limit over ninety for the folds,
+  shins below turf for the ground), so the weights here compare like with
+  like and a golfer filmed small is solved by the same rules as one filmed
+  large.
+*/
+public struct SkeletonIKConfig {
+    public var enabled: Bool = true
+    /// Levenberg-Marquardt outer iterations per frame. The solve starts
+    /// from a pose the sequential stages already corrected, so it
+    /// converges in two or three; four is the ceiling.
+    public var iterations: Int = 4
+    /// Initial LM damping. Adapted per iteration: divided by three on a
+    /// cost decrease, multiplied by four on an increase.
+    public var initialDamping: Double = 0.05
+    /// Fidelity weight of a fully visible joint, and the floor at zero
+    /// visibility. The floor keeps the system determined: a held wrist
+    /// still has SOME say, otherwise the constraints alone could spin it
+    /// freely about the elbow.
+    public var fidelityWeight: Double = 1.0
+    public var minFidelityWeight: Double = 0.2
+    /// Hips are the world origin and the root of every chain; the solve
+    /// is never allowed to pay for a limb error by moving the pelvis.
+    public var hipFidelityWeight: Double = 6.0
+    /// Rigid length residuals (the twelve pose-invariant lengths).
+    public var lengthWeight: Double = 2.5
+    /// Fold limit hinges (elbows and knees).
+    public var foldWeight: Double = 2.0
+    /// The turf hinge under each ankle.
+    public var groundWeight: Double = 3.0
+    /// Trust region: no joint moves further than this fraction of the
+    /// clip-median shin in one frame's solve, whatever the constraints
+    /// ask. The solve is a refinement of the corrected pose, never a
+    /// redraw.
+    public var maxJointMoveShinFraction: Double = 0.35
+    /// A frame whose total constraint residual is already under this is
+    /// left alone: nothing to solve, nothing to count.
+    public var minResidualToSolve: Double = 0.015
+    public init() {}
+}
+
+// MARK: - Hypergraph consistency (round five, P2)
+
+/*
+  Constraints over more than two joints at once, as procedural passes. A
+  pairwise stage can say "this bone is this long"; it cannot say "these
+  four joints together form a torso of this height" or "these two bones
+  on opposite sides of the body are the same bone". The two hyperedges
+  shipped are the ones the audits actually needed; the machinery is a
+  procedural pass per hyperedge rather than a generic factor graph on
+  purpose, because a generic graph solver is the IK stage above, and the
+  hyperedges that are NOT least-squares shaped (the symmetry one edits
+  reference constants, not positions) do not belong in it.
+*/
+public struct HypergraphConfig {
+    public var enabled: Bool = true
+    /// Spine hyperedge (both shoulders, both hips): relative deviation of
+    /// the shoulder-midpoint to hip-midpoint distance past this triggers
+    /// a correction, blended at spineBlend. The shoulder pair moves as a
+    /// rigid unit along the measured spine bearing; the hips, the origin,
+    /// never move.
+    public var spineTolerance: Double = 0.10
+    public var spineBlend: Double = 0.5
+    /// Bilateral hyperedge (a bone and its twin): left and right reference
+    /// lengths differing by more than this relative amount are
+    /// reconciled toward the better seen side.
+    public var symmetryTolerance: Double = 0.12
     public init() {}
 }
 
@@ -958,12 +1144,20 @@ public struct GMMPosePrior {
         }
         // logsumexp for the total.
         let m = componentLogs[best]
-        let total = m + Foundation.log(componentLogs.reduce(0) { $0 + exp($1 - m) })
+        let total = m + Foundation.log(componentLogs.reduce(0) { $0 + Foundation.exp($1 - m) })
         return (total, best)
     }
 }
 
 // MARK: - The corrector
+
+/// A bone or torso segment, as a hashable key for the reference lengths.
+/// File private: no other file needs it, so the CoreTypes rule (shared
+/// shapes live in one place) does not apply.
+struct JointPair: Hashable {
+    let a: Int
+    let b: Int
+}
 
 public final class PosePriorCorrector {
 
@@ -996,6 +1190,13 @@ public final class PosePriorCorrector {
         public var gripCluster = GripClusterConfig()
         /// Kinematic wrist-to-palm distance guard (Video 1 impact fix).
         public var handCollapse = HandCollapseGuardConfig()
+        /// Round five (P0): how body constants resolve against the address
+        /// reference.
+        public var reference = ReferenceResolutionConfig()
+        /// Round five (P1): the damped least squares IK solve.
+        public var ik = SkeletonIKConfig()
+        /// Round five (P2): the hypergraph consistency passes.
+        public var hypergraph = HypergraphConfig()
         public init() {}
     }
 
@@ -1013,6 +1214,27 @@ public final class PosePriorCorrector {
     /// run() has executed once. Internal, matching SwingView's own access
     /// level.
     private(set) var detectedView: SwingView?
+
+    /*
+      ROUND FIVE. The address reference the orchestrator captured, if any,
+      mapped onto this timeline's own grid by timestamp at the top of run(),
+      plus the counters every resolution through bodyConstant(_:) feeds.
+      Reset per run so a corrector reused across clips cannot carry one
+      clip's verdicts into another's QC.
+    */
+    private var reference: AddressReference?
+    private var referenceFrames: [Int] = []
+    private var referenceUsed = 0
+    private var referenceRejected = 0
+
+    /*
+      Pose-invariant world lengths, resolved once per run at the top of
+      run() (after the view profile, before any stage moves a joint) and
+      reconciled by the bilateral symmetry hyperedge. The bone projection
+      and the IK both read these, so the two stages can never disagree
+      about how long a bone is.
+    */
+    private var referenceLengths: [JointPair: Double] = [:]
 
     /*
       The lead wrist's normalised track, aligned to the timeline grid, NaN
@@ -1041,7 +1263,14 @@ public final class PosePriorCorrector {
     }
 
     public func run(_ timeline: inout PoseTimeline, qc: inout TrackingQC) {
-        run(&timeline, qc: &qc, view: nil)
+        run(&timeline, qc: &qc, view: nil, reference: nil)
+    }
+
+    /// Round five: the public spelling that carries the address reference
+    /// without naming the internal SwingView. The orchestrator uses the
+    /// internal entry below so it can pass both.
+    public func run(_ timeline: inout PoseTimeline, qc: inout TrackingQC, reference: AddressReference?) {
+        run(&timeline, qc: &qc, view: nil, reference: reference)
     }
 
     /*
@@ -1058,8 +1287,12 @@ public final class PosePriorCorrector {
       two-argument call binds the entry above (Swift prefers the overload
       that needs no default arguments filled), and only an explicit view
       reaches this one.
+
+      Round five adds the address reference the same way: nil means "no
+      window captured" and every body constant resolves to its clip median
+      exactly as before.
     */
-    func run(_ timeline: inout PoseTimeline, qc: inout TrackingQC, view: SwingView? = nil) {
+    func run(_ timeline: inout PoseTimeline, qc: inout TrackingQC, view: SwingView? = nil, reference: AddressReference? = nil) {
         guard timeline.frameCount > 2 else { return }
 
         // Route the view profile first (the research brief's "separate DTL
@@ -1075,6 +1308,19 @@ public final class PosePriorCorrector {
         // certain, so it is the label's only writer.
         qc.detectedViewLabel = resolvedView == .faceOn ? "faceOn" : "downTheLine"
         config = Self.profiled(baseConfig, for: resolvedView)
+
+        // Round five, step 0b: the address reference onto this grid, by
+        // timestamp, so a reference captured on the provisional pass lands
+        // on the same moments here whatever the two grids did.
+        self.reference = reference
+        referenceFrames = reference?.frameIndices(in: timeline.times) ?? []
+        referenceUsed = 0
+        referenceRejected = 0
+        qc.addressReferenceFrames = referenceFrames.count
+
+        // Round five, step 0c: the reference lengths, reconciled left
+        // against right before anything reads them.
+        resolveReferenceLengths(timeline, qc: &qc)
 
         projectOccludedShoulders(&timeline, qc: &qc)    // Fix S rebuilt. FIRST,
                                                         // before the bones: the
@@ -1092,6 +1338,10 @@ public final class PosePriorCorrector {
                                                         // never splits a
                                                         // collapse error with
                                                         // the good shoulder
+        enforceSpineLength(&timeline, qc: &qc)          // round five hyperedge:
+                                                        // the shoulder pair at
+                                                        // its reference height
+                                                        // above the hips
         projectBoneLengths(&timeline, qc: &qc)          // proximal to distal,
                                                         // from the corrected
                                                         // shoulders and hips
@@ -1113,11 +1363,22 @@ public final class PosePriorCorrector {
                                                         // already back on the
                                                         // club
         enforceHandSeparation(&timeline, qc: &qc)       // Video 1 fix
+        solveSkeletonIK(&timeline, qc: &qc)             // round five: the one
+                                                        // joint solve, after
+                                                        // every stage that
+                                                        // repositions a joint
         gmm?.run(&timeline, qc: &qc)                    // TASK 5, when a model ships
         enforceGroundBackstop(&timeline, qc: &qc)       // turf is not negotiable:
                                                         // nothing the later
                                                         // stages did may leave
                                                         // a foot underground
+
+        // Round five QC: how the body constants resolved this run. Written
+        // here, once, so the orchestrator's later backstop call (which
+        // re-estimates the ground plane through the same resolver) cannot
+        // double count a decision already recorded.
+        qc.referenceConstantsUsed = referenceUsed
+        qc.referenceConstantsRejected = referenceRejected
 
         // The hand path anchor: the corrected lead wrist. With grip fusion
         // removed there is no fusion step after this, so the wrist stays the
@@ -1133,6 +1394,175 @@ public final class PosePriorCorrector {
             leadHandPathNormX = []
             leadHandPathNormY = []
         }
+    }
+
+    // MARK: - Body constants through the address reference (round five, P0)
+
+    /// A resolved body constant and where it came from.
+    struct BodyConstant {
+        var value: Double
+        var fromReference: Bool
+    }
+
+    /*
+      THE ONE RESOLVER. Every stage hands in one measurement per grid frame
+      (nil where the frame could not measure it) and gets back the golfer's
+      true value. The clip median is computed exactly as the stages always
+      did (the same "more than eight samples" floor), then the reference
+      median over the address frames is believed instead when the window
+      carries enough confident samples and the two agree to within the
+      band. Levels pass an absolute tolerance (in the measured units) since
+      a y coordinate has no relative scale; lengths use the relative band.
+      clipValue lets a stage that does not use a plain median (the ground
+      plane's toward-ground percentile) keep its own clip estimate and still
+      resolve through the same gate.
+    */
+    private func bodyConstant(
+        _ perFrame: [Double?],
+        minClipSamples: Int = 9,
+        clipValue: Double? = nil,
+        absoluteTolerance: Double? = nil
+    ) -> BodyConstant? {
+        var clip: [Double] = []
+        clip.reserveCapacity(perFrame.count)
+        for v in perFrame { if let v, v.isFinite { clip.append(v) } }
+        guard clip.count >= minClipSamples else { return nil }
+        let clipMedian: Double
+        if let clipValue {
+            clipMedian = clipValue
+        } else {
+            clip.sort()
+            clipMedian = clip[clip.count / 2]
+        }
+        let rc = config.reference
+        guard rc.enabled, reference != nil, !referenceFrames.isEmpty else {
+            return BodyConstant(value: clipMedian, fromReference: false)
+        }
+        var ref: [Double] = []
+        for i in referenceFrames where i >= 0 && i < perFrame.count {
+            if let v = perFrame[i], v.isFinite { ref.append(v) }
+        }
+        guard ref.count >= rc.minReferenceSamples else {
+            referenceRejected += 1
+            return BodyConstant(value: clipMedian, fromReference: false)
+        }
+        ref.sort()
+        let refMedian = ref[ref.count / 2]
+        let agrees: Bool
+        if let tol = absoluteTolerance {
+            agrees = abs(refMedian - clipMedian) <= tol
+        } else {
+            let scale = Swift.max(abs(clipMedian), 1e-9)
+            agrees = abs(refMedian - clipMedian) / scale <= rc.maxRelativeDisagreement
+        }
+        guard agrees else {
+            referenceRejected += 1
+            return BodyConstant(value: clipMedian, fromReference: false)
+        }
+        referenceUsed += 1
+        let w = Geometry.clamp(rc.referenceWeight, 0, 1)
+        return BodyConstant(value: Geometry.lerp(clipMedian, refMedian, w), fromReference: true)
+    }
+
+    /// Best-available per-sample visibility, norm preferred, the house
+    /// convention everywhere trust is read. NaN (the Vision backend) reads
+    /// as trusted.
+    private func visibility(_ timeline: PoseTimeline, _ j: Int, _ i: Int) -> Double {
+        let v = timeline.norm.visibility[j][i]
+        if v.isFinite { return v }
+        let w = timeline.world.visibility[j][i]
+        return w.isFinite ? w : 1
+    }
+
+    /// 3D world length of a segment this frame, depth folded in only when
+    /// both ends carry it (the bone projection's rule).
+    private func worldLength(_ timeline: PoseTimeline, _ a: Int, _ b: Int, _ i: Int) -> Double? {
+        let ax = timeline.world.x[a][i], ay = timeline.world.y[a][i]
+        let bx = timeline.world.x[b][i], by = timeline.world.y[b][i]
+        guard ax.isFinite, ay.isFinite, bx.isFinite, by.isFinite else { return nil }
+        let az = timeline.world.z[a][i], bz = timeline.world.z[b][i]
+        let dz = (az.isFinite && bz.isFinite) ? az - bz : 0
+        let dx = ax - bx, dy = ay - by
+        let l = (dx * dx + dy * dy + dz * dz).squareRoot()
+        return l > 1e-6 ? l : nil
+    }
+
+    // MARK: - Reference lengths and the bilateral symmetry hyperedge (round five)
+
+    /// The four torso segments the IK holds rigid alongside the limb bones:
+    /// the two widths and the two sides.
+    private static let torsoSegments: [(a: Int, b: Int)] = [
+        (Landmarks.LEFT_SHOULDER, Landmarks.RIGHT_SHOULDER),
+        (Landmarks.LEFT_HIP, Landmarks.RIGHT_HIP),
+        (Landmarks.LEFT_SHOULDER, Landmarks.LEFT_HIP),
+        (Landmarks.RIGHT_SHOULDER, Landmarks.RIGHT_HIP),
+    ]
+
+    /// Each left segment with its right twin, for the symmetry hyperedge.
+    private static let bilateralPairs: [(left: JointPair, right: JointPair)] = [
+        (JointPair(a: Landmarks.LEFT_SHOULDER, b: Landmarks.LEFT_ELBOW),
+         JointPair(a: Landmarks.RIGHT_SHOULDER, b: Landmarks.RIGHT_ELBOW)),
+        (JointPair(a: Landmarks.LEFT_ELBOW, b: Landmarks.LEFT_WRIST),
+         JointPair(a: Landmarks.RIGHT_ELBOW, b: Landmarks.RIGHT_WRIST)),
+        (JointPair(a: Landmarks.LEFT_HIP, b: Landmarks.LEFT_KNEE),
+         JointPair(a: Landmarks.RIGHT_HIP, b: Landmarks.RIGHT_KNEE)),
+        (JointPair(a: Landmarks.LEFT_KNEE, b: Landmarks.LEFT_ANKLE),
+         JointPair(a: Landmarks.RIGHT_KNEE, b: Landmarks.RIGHT_ANKLE)),
+        (JointPair(a: Landmarks.LEFT_SHOULDER, b: Landmarks.LEFT_HIP),
+         JointPair(a: Landmarks.RIGHT_SHOULDER, b: Landmarks.RIGHT_HIP)),
+    ]
+
+    /*
+      Resolve every pose-invariant world length through the reference, then
+      run the BILATERAL SYMMETRY hyperedge over the twins. A golfer's two
+      forearms are the same bone, and when the two resolved lengths
+      disagree past tolerance one of them was measured through an occlusion
+      (down the line the trail arm spends half the clip behind the torso).
+      The side whose joints the tracker saw less of adopts the better seen
+      side's length when the trust gap is clear, and the two meet at their
+      mean when it is not. Edits constants, never positions: the positions
+      follow when the bone stage and the IK read the reconciled lengths.
+      Counted in qc.bilateralSymmetryReconciled.
+    */
+    private func resolveReferenceLengths(_ timeline: PoseTimeline, qc: inout TrackingQC) {
+        referenceLengths = [:]
+        let n = timeline.frameCount
+        var trust: [JointPair: Double] = [:]
+
+        for seg in Self.bones + Self.torsoSegments {
+            guard max(seg.a, seg.b) < timeline.jointCount else { continue }
+            var perFrame = [Double?](repeating: nil, count: n)
+            var visSum = 0.0, visCount = 0
+            for i in 0..<n {
+                guard let l = worldLength(timeline, seg.a, seg.b, i) else { continue }
+                perFrame[i] = l
+                visSum += Swift.min(visibility(timeline, seg.a, i), visibility(timeline, seg.b, i))
+                visCount += 1
+            }
+            guard let constant = bodyConstant(perFrame) else { continue }
+            let key = JointPair(a: seg.a, b: seg.b)
+            referenceLengths[key] = constant.value
+            trust[key] = visCount > 0 ? visSum / Double(visCount) : 1
+        }
+
+        guard config.hypergraph.enabled else { return }
+        var reconciled = 0
+        for pair in Self.bilateralPairs {
+            guard let l = referenceLengths[pair.left], let r = referenceLengths[pair.right] else { continue }
+            let mean = (l + r) / 2
+            guard mean > 1e-6, abs(l - r) / mean > config.hypergraph.symmetryTolerance else { continue }
+            let tl = trust[pair.left] ?? 1, tr = trust[pair.right] ?? 1
+            if tl - tr > 0.1 {
+                referenceLengths[pair.right] = l
+            } else if tr - tl > 0.1 {
+                referenceLengths[pair.left] = r
+            } else {
+                referenceLengths[pair.left] = mean
+                referenceLengths[pair.right] = mean
+            }
+            reconciled += 1
+        }
+        qc.bilateralSymmetryReconciled += reconciled
     }
 
     // MARK: - View profiles (DTL versus face-on)
@@ -1327,6 +1757,11 @@ public final class PosePriorCorrector {
       length would break every forearm that points at the camera. The two
       spaces cannot disagree about missingness because nothing here creates
       or removes samples.
+
+      Round five: the true length is no longer the bare clip median but
+      the reference length resolved at the top of run() (the address
+      window when it is usable, the clip median when it is not), after
+      the bilateral symmetry hyperedge reconciled it against its twin.
     */
     private func projectBoneLengths(_ timeline: inout PoseTimeline, qc: inout TrackingQC) {
         var correctedFrames = Set<Int>()
@@ -1346,12 +1781,7 @@ public final class PosePriorCorrector {
                 return l > 1e-6 ? l : nil
             }
 
-            var lengths: [Double] = []
-            for i in 0..<n { if let l = length(i) { lengths.append(l) } }
-            guard lengths.count > 8 else { continue }
-            lengths.sort()
-            let median = lengths[lengths.count / 2]
-            guard median > 1e-6 else { continue }
+            guard let median = referenceLengths[JointPair(a: bone.a, b: bone.b)], median > 1e-6 else { continue }
 
             for i in 0..<n {
                 guard let l = length(i), abs(l - median) / median > config.boneTolerance else { continue }
@@ -1425,6 +1855,12 @@ public final class PosePriorCorrector {
       dominance test names no side used to convict nobody, which is how
       the face-on both-shoulders collapse survived. Those frames now get
       a two-sided reseat at a softer blend; see section 2b below.
+
+      Round five: the width and the two radii resolve through the address
+      reference (bodyConstant), which is where the pools this stage
+      tolerated polluting ("collapses cluster in the top and finish
+      windows, medians shrug off a minority") stop mattering: at address
+      neither shoulder is collapsed.
     */
     private func projectOccludedShoulders(_ timeline: inout PoseTimeline, qc: inout TrackingQC) {
         let c = config.shoulder
@@ -1478,43 +1914,40 @@ public final class PosePriorCorrector {
         // A collapsed frame with confident visibility does feed the pools,
         // and that is tolerated on purpose: collapses cluster in the top
         // and finish windows, medians shrug off a minority, and excluding
-        // them would need the very statistics being learned.
+        // them would need the very statistics being learned. Round five:
+        // the pools are per frame so the address reference can be read
+        // off the same measurements.
 
-        var widthsW: [Double] = []
-        var radiiL: [Double] = []
-        var radiiR: [Double] = []
-        var widthsNorm: [Double] = []
+        var widthsW = [Double?](repeating: nil, count: n)
+        var radiiL = [Double?](repeating: nil, count: n)
+        var radiiR = [Double?](repeating: nil, count: n)
+        var widthsNorm = [Double?](repeating: nil, count: n)
         for i in 0..<n {
             let anchored = vis(lh, i) >= c.anchorMinVisibility && vis(rh, i) >= c.anchorMinVisibility
             guard anchored else { continue }
             if vis(ls, i) >= c.anchorMinVisibility, vis(rs, i) >= c.anchorMinVisibility {
                 if let a = w3(ls, i), let b = w3(rs, i) {
                     let w = dist3(a, b)
-                    if w > 1e-6 { widthsW.append(w) }
+                    if w > 1e-6 { widthsW[i] = w }
                 }
-                if let d = normPlanarDist(ls, rs, i) { widthsNorm.append(d) }
+                if let d = normPlanarDist(ls, rs, i) { widthsNorm[i] = d }
             }
             if let h = hipCentreW(i) {
                 if vis(ls, i) >= c.anchorMinVisibility, let a = w3(ls, i) {
                     let r = dist3(a, h)
-                    if r > 1e-6 { radiiL.append(r) }
+                    if r > 1e-6 { radiiL[i] = r }
                 }
                 if vis(rs, i) >= c.anchorMinVisibility, let b = w3(rs, i) {
                     let r = dist3(b, h)
-                    if r > 1e-6 { radiiR.append(r) }
+                    if r > 1e-6 { radiiR[i] = r }
                 }
             }
         }
 
-        func median(_ values: inout [Double]) -> Double? {
-            guard values.count > 8 else { return nil }
-            values.sort()
-            return values[values.count / 2]
-        }
-        guard let widthMedian = median(&widthsW),
-              let radiusLeft = median(&radiiL),
-              let radiusRight = median(&radiiR) else { return }
-        let normWidthMedian = median(&widthsNorm)
+        guard let widthMedian = bodyConstant(widthsW)?.value,
+              let radiusLeft = bodyConstant(radiiL)?.value,
+              let radiusRight = bodyConstant(radiiR)?.value else { return }
+        let normWidthMedian = bodyConstant(widthsNorm)?.value
         func radius(_ shoulder: Int) -> Double { shoulder == ls ? radiusLeft : radiusRight }
 
         // ---- 1b. Conviction: pose-invariant collapse detection -----------
@@ -1780,6 +2213,9 @@ public final class PosePriorCorrector {
           s' = sqrt(s * h * R_median)      h' = sqrt(s * h / R_median)
 
       then blended partially, the house style: nudged, not redrawn.
+
+      Round five: the widths and the ratios resolve through the address
+      reference like every other body constant.
     */
     private func enforceBiomechanicalRatios(_ timeline: inout PoseTimeline, qc: inout TrackingQC) {
         let ls = Landmarks.LEFT_SHOULDER, rs = Landmarks.RIGHT_SHOULDER
@@ -1821,19 +2257,13 @@ public final class PosePriorCorrector {
             }
         }
 
-        func median(_ values: [Double]) -> Double? {
-            guard values.count > 8 else { return nil }
-            let sorted = values.sorted()
-            return sorted[sorted.count / 2]
-        }
-
         // Rule 1: world widths toward their own clip medians.
         var widthFrames = Set<Int>()
         var worldBank = timeline.channels(.world)
         for pair in [(ls, rs), (lh, rh)] {
-            var widths: [Double] = []
-            for i in 0..<n { if let w = width(worldBank, pair.0, pair.1, i, threeD: true) { widths.append(w) } }
-            guard let med = median(widths), med > 1e-6 else { continue }
+            var widths = [Double?](repeating: nil, count: n)
+            for i in 0..<n { widths[i] = width(worldBank, pair.0, pair.1, i, threeD: true) }
+            guard let med = bodyConstant(widths)?.value, med > 1e-6 else { continue }
             for i in 0..<n {
                 guard let w = width(worldBank, pair.0, pair.1, i, threeD: true),
                       abs(w - med) / med > config.torsoWidthTolerance else { continue }
@@ -1853,13 +2283,13 @@ public final class PosePriorCorrector {
             let threeD = space == .world
             var bank = timeline.channels(space)
 
-            var ratios: [Double] = []
+            var ratios = [Double?](repeating: nil, count: n)
             for i in 0..<n {
                 guard let s = width(bank, ls, rs, i, threeD: threeD),
                       let h = width(bank, lh, rh, i, threeD: threeD) else { continue }
-                ratios.append(s / h)
+                ratios[i] = s / h
             }
-            guard let medRatio = median(ratios), medRatio > 1e-6 else { continue }
+            guard let medRatio = bodyConstant(ratios)?.value, medRatio > 1e-6 else { continue }
 
             for i in 0..<n {
                 guard let s = width(bank, ls, rs, i, threeD: threeD),
@@ -1880,6 +2310,77 @@ public final class PosePriorCorrector {
             timeline.setChannels(space, bank)
         }
         qc.torsoRatioCorrections += ratioFrames.count
+    }
+
+    // MARK: - Spine length hyperedge (round five, P2)
+
+    /*
+      Four joints, one constraint no pair can state: the shoulder midpoint
+      sits a fixed 3D distance from the hip midpoint. The width stage holds
+      each pair's width and the reseat holds each shoulder's radius, but a
+      frame where both shoulders drift up or down the torso together (the
+      audited "short torso" at the top, where the occluded trail side drags
+      the lead shoulder's height estimate with it) passes every pairwise
+      test: width fine, ratio fine, radii both plausibly short. The spine
+      length catches it directly.
+
+      World space only, the bone projection's argument: metric torso height
+      is pose invariant, while the projected spine foreshortens honestly
+      when the golfer bends toward a face-on camera. The correction moves
+      the shoulder PAIR as a rigid unit along the measured spine bearing
+      (the direction from hip midpoint to shoulder midpoint this frame),
+      so the shoulder line's width, tilt and rotation are all untouched and
+      only the torso's height changes; the hips, the world origin, never
+      move. Blended, the house style. The reference length is the mean of
+      the two torso sides resolved at the top of run(), which the
+      bilateral hyperedge has already reconciled. Counted in
+      qc.spineLengthCorrections.
+    */
+    private func enforceSpineLength(_ timeline: inout PoseTimeline, qc: inout TrackingQC) {
+        let c = config.hypergraph
+        guard c.enabled, timeline.frameCount > 8 else { return }
+        let ls = Landmarks.LEFT_SHOULDER, rs = Landmarks.RIGHT_SHOULDER
+        let lh = Landmarks.LEFT_HIP, rh = Landmarks.RIGHT_HIP
+        guard max(ls, rs, lh, rh) < timeline.jointCount else { return }
+        let n = timeline.frameCount
+
+        func mid(_ a: Int, _ b: Int, _ i: Int) -> (x: Double, y: Double, z: Double, hasZ: Bool)? {
+            let ax = timeline.world.x[a][i], ay = timeline.world.y[a][i]
+            let bx = timeline.world.x[b][i], by = timeline.world.y[b][i]
+            guard ax.isFinite, ay.isFinite, bx.isFinite, by.isFinite else { return nil }
+            let az = timeline.world.z[a][i], bz = timeline.world.z[b][i]
+            let hasZ = az.isFinite && bz.isFinite
+            return ((ax + bx) / 2, (ay + by) / 2, hasZ ? (az + bz) / 2 : 0, hasZ)
+        }
+
+        // The spine length per frame, for the clip median when the sides
+        // were not resolvable (a Vision clip with no reference lengths).
+        var perFrame = [Double?](repeating: nil, count: n)
+        for i in 0..<n {
+            guard let s = mid(ls, rs, i), let h = mid(lh, rh, i) else { continue }
+            let dz = (s.hasZ && h.hasZ) ? s.z - h.z : 0
+            let l = ((s.x - h.x) * (s.x - h.x) + (s.y - h.y) * (s.y - h.y) + dz * dz).squareRoot()
+            if l > 1e-6 { perFrame[i] = l }
+        }
+        guard let spine = bodyConstant(perFrame)?.value, spine > 1e-6 else { return }
+
+        var corrected = 0
+        for i in 0..<n {
+            guard let l = perFrame[i], abs(l - spine) / spine > c.spineTolerance,
+                  let s = mid(ls, rs, i), let h = mid(lh, rh, i) else { continue }
+            let target = Geometry.lerp(l, spine, c.spineBlend)
+            let k = target / l - 1
+            let useZ = s.hasZ && h.hasZ
+            let dx = (s.x - h.x) * k, dy = (s.y - h.y) * k
+            let dz = useZ ? (s.z - h.z) * k : 0
+            for j in [ls, rs] {
+                timeline.world.x[j][i] += dx
+                timeline.world.y[j][i] += dy
+                if useZ, timeline.world.z[j][i].isFinite { timeline.world.z[j][i] += dz }
+            }
+            corrected += 1
+        }
+        qc.spineLengthCorrections += corrected
     }
 
     // MARK: - Ground plane (Fix 4)
@@ -1908,6 +2409,13 @@ public final class PosePriorCorrector {
       Estimate the plane for one space from the clip's own feet. Returns nil
       when the clip never produced enough foot samples to trust, in which
       case the constraint stage simply does not run, the honest fallback.
+
+      Round five: the per-side turf level and the ankle resting level both
+      resolve through bodyConstant(_:), with the clip's toward-ground
+      percentile as the clip value and the address median (both feet flat,
+      nothing sunk, nothing lifted) as the reference, gated by an absolute
+      tolerance in shins. The percentile's job was robustness to sunk
+      outliers; the address window has none.
     */
     func estimateGroundPlane(_ bank: PoseTimeline.Channels, frameCount: Int, jointCount: Int) -> GroundPlaneEstimate? {
         let feet: [(heel: Int, toe: Int, ankle: Int, knee: Int, hip: Int)] = [
@@ -1964,15 +2472,20 @@ public final class PosePriorCorrector {
         // grows with (y - level) and up must be -1.
         let up: Double = hipMedianY < footMedianY ? 1 : -1
 
+        let levelTolerance = config.reference.maxLevelDisagreementShinFraction * shin
+
         // Per side turf level: the toward-ground 75th percentile of that
         // foot's pooled heel and toe y. Lifted-heel frames sit on the
         // away-from-ground side of the distribution and cannot raise it;
         // the last quartile absorbs the occasional below-turf outlier.
         func level(_ side: (heel: Int, toe: Int, ankle: Int, knee: Int, hip: Int)) -> Double? {
             var ys: [Double] = []
+            var perFrame = [Double?](repeating: nil, count: frameCount)
             for i in 0..<frameCount {
-                if finite(side.heel, i) { ys.append(bank.y[side.heel][i]) }
-                if finite(side.toe, i) { ys.append(bank.y[side.toe][i]) }
+                var sum = 0.0, count = 0
+                if finite(side.heel, i) { ys.append(bank.y[side.heel][i]); sum += bank.y[side.heel][i]; count += 1 }
+                if finite(side.toe, i) { ys.append(bank.y[side.toe][i]); sum += bank.y[side.toe][i]; count += 1 }
+                if count > 0 { perFrame[i] = sum / Double(count) }
             }
             guard ys.count > 8 else { return nil }
             // Sort so that the ground end comes last, then take the 75th
@@ -1981,7 +2494,12 @@ public final class PosePriorCorrector {
             // up = +1 (image-like, ground at large y) ascending puts the
             // ground end last; with up = -1 (y-up world) descending does.
             ys.sort { up > 0 ? $0 < $1 : $0 > $1 }
-            return ys[min(ys.count - 1, (ys.count * 3) / 4)]
+            let percentile = ys[min(ys.count - 1, (ys.count * 3) / 4)]
+            // Round five: the address window's mean sole level, when the
+            // window is usable, IS the turf.
+            return bodyConstant(
+                perFrame, minClipSamples: 1, clipValue: percentile, absoluteTolerance: levelTolerance
+            )?.value ?? percentile
         }
         guard let left = level(feet[0]), let right = level(feet[1]) else { return nil }
 
@@ -1992,15 +2510,20 @@ public final class PosePriorCorrector {
         // the occasional sunk outlier this whole extension exists to stop.
         func ankleLevel(_ side: (heel: Int, toe: Int, ankle: Int, knee: Int, hip: Int)) -> Double? {
             var ys: [Double] = []
+            var perFrame = [Double?](repeating: nil, count: frameCount)
             for i in 0..<frameCount where finite(side.ankle, i) {
                 ys.append(bank.y[side.ankle][i])
+                perFrame[i] = bank.y[side.ankle][i]
             }
             guard ys.count > 8 else { return nil }
             // Toward-ground end last, under the corrected up sign: with
             // up = +1 (image-like, ground at large y) ascending puts the
             // ground end last; with up = -1 (y-up world) descending does.
             ys.sort { up > 0 ? $0 < $1 : $0 > $1 }
-            return ys[min(ys.count - 1, (ys.count * 3) / 4)]
+            let percentile = ys[min(ys.count - 1, (ys.count * 3) / 4)]
+            return bodyConstant(
+                perFrame, minClipSamples: 1, clipValue: percentile, absoluteTolerance: levelTolerance
+            )?.value ?? percentile
         }
 
         return GroundPlaneEstimate(
@@ -2460,6 +2983,10 @@ public final class PosePriorCorrector {
       applied identically to that side's held knuckles (index, pinky,
       thumb), so the hand rides the wrist instead of kinking into the
       audited V. Detailed at the pass 2 write loop below.
+
+      Round five: the confident grip separation resolves through the
+      address reference, where it is at its cleanest (two still hands on a
+      visible handle).
     */
     private func anchorGripCluster(_ timeline: inout PoseTimeline, qc: inout TrackingQC) {
         let c = config.gripCluster
@@ -2502,12 +3029,12 @@ public final class PosePriorCorrector {
             // trusted bar. Those are the frames where the tracker actually
             // saw the grip, so the median is what a grip looks like on
             // this golfer, at this framing, in this space's units.
-            var confidentSeps: [Double] = []
+            var confidentSeps = [Double?](repeating: nil, count: n)
             for i in 0..<n {
                 guard vis(lw, i) >= c.trustedMinVisibility,
                       vis(rw, i) >= c.trustedMinVisibility,
                       let s = separation(i) else { continue }
-                confidentSeps.append(s)
+                confidentSeps[i] = s
             }
 
             // The forearm yardstick for the fallback, pooled over both
@@ -2527,9 +3054,8 @@ public final class PosePriorCorrector {
             guard medianForearm > 1e-6 else { continue }
 
             let gripSep: Double
-            if confidentSeps.count > 8 {
-                confidentSeps.sort()
-                gripSep = confidentSeps[confidentSeps.count / 2]
+            if let resolved = bodyConstant(confidentSeps)?.value {
+                gripSep = resolved
             } else {
                 gripSep = c.fallbackSeparationForearmFraction * medianForearm
             }
@@ -2805,29 +3331,28 @@ public final class PosePriorCorrector {
 
         // Clip medians in this space's own units: the hand span (wrist to
         // palm centre) and the forearm. Collapsed frames are a handful out
-        // of hundreds, so the median shrugs them off.
-        var handSpans: [Double] = []
-        var forearms: [Double] = []
+        // of hundreds, so the median shrugs them off. Round five: both
+        // resolve through the address reference, where the hand is still
+        // and whole.
+        var handSpans = [Double?](repeating: nil, count: n)
+        var forearms = [Double?](repeating: nil, count: n)
         for i in 0..<n {
             if finite2(arm.wrist, i), let p = palm(i) {
-                handSpans.append(dist(
+                handSpans[i] = dist(
                     bank.x[arm.wrist][i], bank.y[arm.wrist][i], bank.z[arm.wrist][i],
                     p.x, p.y, p.z
-                ))
+                )
             }
             if finite2(arm.elbow, i), finite2(arm.wrist, i) {
                 let f = dist(
                     bank.x[arm.elbow][i], bank.y[arm.elbow][i], bank.z[arm.elbow][i],
                     bank.x[arm.wrist][i], bank.y[arm.wrist][i], bank.z[arm.wrist][i]
                 )
-                if f > 1e-6 { forearms.append(f) }
+                if f > 1e-6 { forearms[i] = f }
             }
         }
-        guard handSpans.count > 8, forearms.count > 8 else { return }
-        handSpans.sort()
-        forearms.sort()
-        let medianHand = handSpans[handSpans.count / 2]
-        let medianForearm = forearms[forearms.count / 2]
+        guard let medianHand = bodyConstant(handSpans)?.value,
+              let medianForearm = bodyConstant(forearms)?.value else { return }
         guard medianForearm > 1e-6 else { return }
 
         // The anatomical minimum the brief asked for, defined against the
@@ -2881,6 +3406,378 @@ public final class PosePriorCorrector {
                 }
             }
             correctedFrames.insert(i)
+        }
+    }
+
+    // MARK: - Damped least squares IK (round five, P1)
+
+    /// The twelve joints the solve owns, in local order: shoulders, elbows,
+    /// wrists, hips, knees, ankles. Heels, toes and hand points stay with
+    /// the stages that own them (the ground plane and the hand guards).
+    private static let ikJoints: [Int] = [
+        Landmarks.LEFT_SHOULDER, Landmarks.RIGHT_SHOULDER,
+        Landmarks.LEFT_ELBOW, Landmarks.RIGHT_ELBOW,
+        Landmarks.LEFT_WRIST, Landmarks.RIGHT_WRIST,
+        Landmarks.LEFT_HIP, Landmarks.RIGHT_HIP,
+        Landmarks.LEFT_KNEE, Landmarks.RIGHT_KNEE,
+        Landmarks.LEFT_ANKLE, Landmarks.RIGHT_ANKLE,
+    ]
+
+    /*
+      ONE SOLVE PER FRAME, world space. The sequential stages above each
+      enforce one constraint by moving one joint, and the audits showed the
+      seam: the bone projection slides a wrist to restore the forearm after
+      the reseat moved the shoulder, which reopens the upper arm the
+      projection just closed; the fold guard relaxes an elbow the torso
+      stage then rescales. Each stage is right on its own and the pose
+      satisfies whichever ran last. This stage asks for all of them at
+      once and finds the nearest pose that honours every one:
+
+          minimise  sum over joints   w_j^2 |x_j - m_j|^2 / shin^2
+                  + sum over lengths  (k_L (|x_a - x_b| - L) / L)^2
+                  + sum over hinges   (k_F max(0, theta_min - theta) / 90)^2
+                  + sum over ankles   (k_G max(0, penetration) / shin)^2
+
+      Levenberg-Marquardt on the stacked residual: analytic Jacobians for
+      the fidelity, length and ground rows (all closed form), central
+      differences for the four hinge rows (nine coordinates each, cheap),
+      normal equations with Marquardt diagonal damping, a Cholesky solve of
+      the 36 by 36 system, damping adapted on accept or reject. The
+      fidelity weight is the joint's own visibility, floored so a held
+      sample still anchors its chain, and the hips are pinned hard: they
+      are the world origin and no limb error may be paid for by moving the
+      pelvis. A joint without finite depth is pinned in z so the solve
+      cannot invent a coordinate the write-back would then discard.
+
+      Bounded, like every stage here: a per-joint trust region in shins
+      caps the move whatever the constraints ask, so the solve refines the
+      corrected pose and never redraws it; frames already consistent (the
+      stacked constraint residual under the floor) are skipped entirely.
+      The world move is mirrored into the normalised set through the hip
+      width bridge the shoulder stage uses, so the overlay and the 3D
+      figure keep moving together; norm z is left alone as always. Runs
+      after every stage that repositions a joint and before the GMM, so
+      the prior scores a self-consistent skeleton. Counted in
+      qc.ikFramesSolved, with the mean relative drop in the constraint
+      residual over solved frames in qc.ikMeanResidualReduction, so a clip
+      can say how inconsistent its skeleton was before the solve.
+    */
+    private func solveSkeletonIK(_ timeline: inout PoseTimeline, qc: inout TrackingQC) {
+        let c = config.ik
+        guard c.enabled, timeline.frameCount > 8 else { return }
+        let joints = Self.ikJoints
+        guard joints.allSatisfy({ $0 < timeline.jointCount }) else { return }
+        let n = timeline.frameCount
+        let m = joints.count
+        let dims = m * 3
+
+        var local: [Int: Int] = [:]
+        for (k, j) in joints.enumerated() { local[j] = k }
+        guard let lhL = local[Landmarks.LEFT_HIP], let rhL = local[Landmarks.RIGHT_HIP],
+              let laL = local[Landmarks.LEFT_ANKLE], let raL = local[Landmarks.RIGHT_ANKLE] else { return }
+
+        // The rigid lengths: every bone and torso segment that resolved.
+        var lengths: [(a: Int, b: Int, l: Double)] = []
+        for seg in Self.bones + Self.torsoSegments {
+            if let la = local[seg.a], let lb = local[seg.b],
+               let l = referenceLengths[JointPair(a: seg.a, b: seg.b)], l > 1e-6 {
+                lengths.append((la, lb, l))
+            }
+        }
+        guard lengths.count >= 4 else { return }
+
+        var hinges: [(a: Int, mid: Int, b: Int)] = []
+        for h in Self.hingeJoints {
+            if let a = local[h.a], let mid = local[h.mid], let b = local[h.b] { hinges.append((a, mid, b)) }
+        }
+
+        // The world shin yardstick, from the reconciled reference lengths.
+        let shinKeys = [
+            JointPair(a: Landmarks.LEFT_KNEE, b: Landmarks.LEFT_ANKLE),
+            JointPair(a: Landmarks.RIGHT_KNEE, b: Landmarks.RIGHT_ANKLE),
+        ]
+        let shins = shinKeys.compactMap { referenceLengths[$0] }
+        guard !shins.isEmpty else { return }
+        let shin = shins.reduce(0, +) / Double(shins.count)
+        guard shin > 1e-6 else { return }
+
+        // The world turf under the ankles. The resolver's counters are
+        // restored around this call: applyGroundConstraints already
+        // recorded these decisions for the world space.
+        let savedUsed = referenceUsed, savedRejected = referenceRejected
+        let plane = config.ground.enabled
+            ? estimateGroundPlane(timeline.world, frameCount: n, jointCount: timeline.jointCount)
+            : nil
+        referenceUsed = savedUsed
+        referenceRejected = savedRejected
+        let ankleFloors: [(local: Int, floor: Double)] = plane.map { p in
+            let lift = p.up * config.ground.minAnkleHeightShinFraction * p.shin
+            return [(laL, p.leftLevel - lift), (raL, p.rightLevel - lift)]
+        } ?? []
+        let groundTolerance = config.ground.penetrationToleranceShinFraction * (plane?.shin ?? shin)
+
+        let maxMove = c.maxJointMoveShinFraction * shin
+        let foldMin = config.foldMinAngleDeg
+        let rows = dims + lengths.count + hinges.count + ankleFloors.count
+
+        var solvedFrames = 0
+        var reductionSum = 0.0
+
+        // Scratch buffers reused across frames.
+        var jac = [Double](repeating: 0, count: rows * dims)
+        var res = [Double](repeating: 0, count: rows)
+        var normal = [Double](repeating: 0, count: dims * dims)
+        var gradient = [Double](repeating: 0, count: dims)
+
+        for i in 0..<n {
+            // Gather the pose; a frame missing any of the twelve joints is
+            // not solved (the chain has a hole the constraints would have
+            // to invent across).
+            var x = [Double](repeating: 0, count: dims)
+            var hasZ = [Bool](repeating: false, count: m)
+            var weight = [Double](repeating: 0, count: m)
+            var complete = true
+            for (k, j) in joints.enumerated() {
+                let px = timeline.world.x[j][i], py = timeline.world.y[j][i], pz = timeline.world.z[j][i]
+                guard px.isFinite, py.isFinite else { complete = false; break }
+                x[3 * k] = px
+                x[3 * k + 1] = py
+                hasZ[k] = pz.isFinite
+                x[3 * k + 2] = pz.isFinite ? pz : 0
+                let v = Geometry.clamp(visibility(timeline, j, i), 0, 1)
+                let fidelity = (k == lhL || k == rhL) ? c.hipFidelityWeight : c.fidelityWeight
+                weight[k] = fidelity * Swift.max(c.minFidelityWeight, v)
+            }
+            guard complete else { continue }
+            let measured = x
+
+            // ---- Residuals ----------------------------------------------
+
+            func fillResiduals(_ x: [Double], into r: inout [Double]) {
+                var row = 0
+                for k in 0..<m {
+                    for d in 0..<3 {
+                        r[row] = weight[k] * (x[3 * k + d] - measured[3 * k + d]) / shin
+                        row += 1
+                    }
+                }
+                for seg in lengths {
+                    let dx = x[3 * seg.a] - x[3 * seg.b]
+                    let dy = x[3 * seg.a + 1] - x[3 * seg.b + 1]
+                    let dz = x[3 * seg.a + 2] - x[3 * seg.b + 2]
+                    let l = (dx * dx + dy * dy + dz * dz).squareRoot()
+                    r[row] = c.lengthWeight * (l - seg.l) / seg.l
+                    row += 1
+                }
+                for h in hinges {
+                    let theta = Geometry.interiorAngleDegrees(
+                        x[3 * h.a], x[3 * h.a + 1], x[3 * h.a + 2],
+                        x[3 * h.mid], x[3 * h.mid + 1], x[3 * h.mid + 2],
+                        x[3 * h.b], x[3 * h.b + 1], x[3 * h.b + 2]
+                    )
+                    r[row] = c.foldWeight * Swift.max(0, foldMin - theta) / 90
+                    row += 1
+                }
+                for g in ankleFloors {
+                    let height = (g.floor - x[3 * g.local + 1]) * (plane?.up ?? 1)
+                    r[row] = c.groundWeight * Swift.max(0, -height - groundTolerance) / shin
+                    row += 1
+                }
+            }
+            func constraintCost(_ r: [Double]) -> Double {
+                var s = 0.0
+                for row in dims..<rows { s += r[row] * r[row] }
+                return s
+            }
+            func totalCost(_ r: [Double]) -> Double {
+                var s = 0.0
+                for row in 0..<rows { s += r[row] * r[row] }
+                return s
+            }
+
+            fillResiduals(x, into: &res)
+            let initialConstraint = constraintCost(res)
+            guard initialConstraint.squareRoot() > c.minResidualToSolve else { continue }
+            var cost = totalCost(res)
+
+            // ---- The Jacobian, analytic where closed form exists --------
+
+            func fillJacobian(_ x: [Double]) {
+                for k in 0..<(rows * dims) { jac[k] = 0 }
+                var row = 0
+                for k in 0..<m {
+                    for d in 0..<3 {
+                        jac[row * dims + 3 * k + d] = weight[k] / shin
+                        row += 1
+                    }
+                }
+                for seg in lengths {
+                    let dx = x[3 * seg.a] - x[3 * seg.b]
+                    let dy = x[3 * seg.a + 1] - x[3 * seg.b + 1]
+                    let dz = x[3 * seg.a + 2] - x[3 * seg.b + 2]
+                    let l = Swift.max((dx * dx + dy * dy + dz * dz).squareRoot(), 1e-9)
+                    let scale = c.lengthWeight / (seg.l * l)
+                    jac[row * dims + 3 * seg.a] = dx * scale
+                    jac[row * dims + 3 * seg.a + 1] = dy * scale
+                    jac[row * dims + 3 * seg.a + 2] = dz * scale
+                    jac[row * dims + 3 * seg.b] = -dx * scale
+                    jac[row * dims + 3 * seg.b + 1] = -dy * scale
+                    jac[row * dims + 3 * seg.b + 2] = -dz * scale
+                    row += 1
+                }
+                let h = 1e-4 * shin
+                for hinge in hinges {
+                    let theta = Geometry.interiorAngleDegrees(
+                        x[3 * hinge.a], x[3 * hinge.a + 1], x[3 * hinge.a + 2],
+                        x[3 * hinge.mid], x[3 * hinge.mid + 1], x[3 * hinge.mid + 2],
+                        x[3 * hinge.b], x[3 * hinge.b + 1], x[3 * hinge.b + 2]
+                    )
+                    if theta < foldMin {
+                        var probe = x
+                        for local in [hinge.a, hinge.mid, hinge.b] {
+                            for d in 0..<3 {
+                                let idx = 3 * local + d
+                                let saved = probe[idx]
+                                probe[idx] = saved + h
+                                let up = Geometry.interiorAngleDegrees(
+                                    probe[3 * hinge.a], probe[3 * hinge.a + 1], probe[3 * hinge.a + 2],
+                                    probe[3 * hinge.mid], probe[3 * hinge.mid + 1], probe[3 * hinge.mid + 2],
+                                    probe[3 * hinge.b], probe[3 * hinge.b + 1], probe[3 * hinge.b + 2]
+                                )
+                                probe[idx] = saved - h
+                                let down = Geometry.interiorAngleDegrees(
+                                    probe[3 * hinge.a], probe[3 * hinge.a + 1], probe[3 * hinge.a + 2],
+                                    probe[3 * hinge.mid], probe[3 * hinge.mid + 1], probe[3 * hinge.mid + 2],
+                                    probe[3 * hinge.b], probe[3 * hinge.b + 1], probe[3 * hinge.b + 2]
+                                )
+                                probe[idx] = saved
+                                // r = k (foldMin - theta) / 90, so dr/dx = -k dtheta/dx / 90.
+                                jac[row * dims + idx] = -c.foldWeight * ((up - down) / (2 * h)) / 90
+                            }
+                        }
+                    }
+                    row += 1
+                }
+                for g in ankleFloors {
+                    let up = plane?.up ?? 1
+                    let height = (g.floor - x[3 * g.local + 1]) * up
+                    if -height - groundTolerance > 0 {
+                        jac[row * dims + 3 * g.local + 1] = c.groundWeight * up / shin
+                    }
+                    row += 1
+                }
+            }
+
+            // ---- Levenberg-Marquardt --------------------------------------
+
+            var lambda = c.initialDamping
+            var trial = [Double](repeating: 0, count: dims)
+            var trialRes = [Double](repeating: 0, count: rows)
+            for _ in 0..<Swift.max(c.iterations, 1) {
+                fillJacobian(x)
+                // Normal equations: A = J^T J, g = J^T r.
+                for k in 0..<(dims * dims) { normal[k] = 0 }
+                for k in 0..<dims { gradient[k] = 0 }
+                for row in 0..<rows {
+                    let base = row * dims
+                    for p in 0..<dims {
+                        let jp = jac[base + p]
+                        if jp == 0 { continue }
+                        gradient[p] += jp * res[row]
+                        for q in p..<dims {
+                            normal[p * dims + q] += jp * jac[base + q]
+                        }
+                    }
+                }
+                for p in 0..<dims {
+                    for q in 0..<p { normal[p * dims + q] = normal[q * dims + p] }
+                }
+
+                var accepted = false
+                for _ in 0..<4 {
+                    var damped = normal
+                    for p in 0..<dims {
+                        damped[p * dims + p] += lambda * Swift.max(normal[p * dims + p], 1e-9) + 1e-12
+                        // Pin the depth of joints that carry none.
+                        if p % 3 == 2, !hasZ[p / 3] { damped[p * dims + p] += 1e9 }
+                    }
+                    let rhs = gradient.map { -$0 }
+                    guard let delta = Geometry.choleskySolve(damped, n: dims, rhs: rhs) else { break }
+                    for p in 0..<dims { trial[p] = x[p] + delta[p] }
+                    fillResiduals(trial, into: &trialRes)
+                    let trialCost = totalCost(trialRes)
+                    if trialCost < cost {
+                        x = trial
+                        res = trialRes
+                        cost = trialCost
+                        lambda = Swift.max(lambda / 3, 1e-6)
+                        accepted = true
+                        break
+                    }
+                    lambda *= 4
+                }
+                if !accepted { break }
+            }
+
+            // ---- Trust region, write back, norm mirror ------------------
+
+            var moved = false
+            for k in 0..<m {
+                var dx = x[3 * k] - measured[3 * k]
+                var dy = x[3 * k + 1] - measured[3 * k + 1]
+                var dz = hasZ[k] ? x[3 * k + 2] - measured[3 * k + 2] : 0
+                let mag = (dx * dx + dy * dy + dz * dz).squareRoot()
+                if mag > maxMove {
+                    let s = maxMove / mag
+                    dx *= s; dy *= s; dz *= s
+                }
+                x[3 * k] = measured[3 * k] + dx
+                x[3 * k + 1] = measured[3 * k + 1] + dy
+                x[3 * k + 2] = measured[3 * k + 2] + dz
+                if mag > 1e-9 { moved = true }
+            }
+            guard moved else { continue }
+
+            fillResiduals(x, into: &res)
+            let finalConstraint = constraintCost(res)
+            solvedFrames += 1
+            if initialConstraint > 1e-12 {
+                reductionSum += Geometry.clamp((initialConstraint - finalConstraint) / initialConstraint, -1, 1)
+            }
+
+            // The world-to-norm bridge from the pre-solve hips, the same
+            // frame-local scale the shoulder stage and the GMM use.
+            let hipScale: Double? = {
+                let lh = Landmarks.LEFT_HIP, rh = Landmarks.RIGHT_HIP
+                let wdx = measured[3 * lhL] - measured[3 * rhL]
+                let wdy = measured[3 * lhL + 1] - measured[3 * rhL + 1]
+                let wdz = measured[3 * lhL + 2] - measured[3 * rhL + 2]
+                let wd = (wdx * wdx + wdy * wdy + wdz * wdz).squareRoot()
+                let nx = timeline.norm.x[lh][i] - timeline.norm.x[rh][i]
+                let ny = timeline.norm.y[lh][i] - timeline.norm.y[rh][i]
+                guard nx.isFinite, ny.isFinite, wd > 1e-6 else { return nil }
+                let nd = (nx * nx + ny * ny).squareRoot()
+                return nd > 1e-9 ? nd / wd : nil
+            }()
+
+            for (k, j) in joints.enumerated() {
+                let dx = x[3 * k] - measured[3 * k]
+                let dy = x[3 * k + 1] - measured[3 * k + 1]
+                let dz = x[3 * k + 2] - measured[3 * k + 2]
+                guard abs(dx) > 1e-12 || abs(dy) > 1e-12 || abs(dz) > 1e-12 else { continue }
+                timeline.world.x[j][i] += dx
+                timeline.world.y[j][i] += dy
+                if hasZ[k] { timeline.world.z[j][i] += dz }
+                if timeline.norm.x[j][i].isFinite, let s = hipScale {
+                    timeline.norm.x[j][i] += dx * s
+                    timeline.norm.y[j][i] += dy * s
+                }
+            }
+        }
+
+        qc.ikFramesSolved += solvedFrames
+        if solvedFrames > 0 {
+            qc.ikMeanResidualReduction = ((reductionSum / Double(solvedFrames)) * 1000).rounded() / 1000
         }
     }
 }

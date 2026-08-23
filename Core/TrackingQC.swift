@@ -4,55 +4,6 @@
 //
 //  Quality control for one processed swing.
 //
-//  The post-processing pipeline corrects data, and a pipeline that corrects
-//  data can hide problems. This record is the antidote: every stage writes
-//  down what it saw and what it changed, so a swing whose skeleton looks
-//  clean but was one third gap fill says so, a future UI badge has something
-//  real to show, and the dataset logger stores honest provenance next to the
-//  cleaned timelines it feeds to future learned priors.
-//
-//  PHASE 2+ ADDITIONS. Four new sections, one per feature that can now touch
-//  the data: golfer selection (which person won and how), the lead-arm
-//  midpoint constraint, the crop refinement pass, and the GMM prior. Every
-//  new field defaults to its zero value, so a QC record written by the
-//  previous build decodes unchanged and simply reads "feature never ran".
-//
-//  VIDEO 1 & 2 AUDIT ADDITIONS. Six new fields to track the hand collapse
-//  guard and the background person selection rules. Fields are added with
-//  sensible defaults so old encoded records still decode if they are ever
-//  read from disk.
-//
-//  ONFORM PARITY ADDITIONS. One section per new stage of the final accuracy
-//  overhaul: the torso width and ratio constraints (Fix 1), the occlusion
-//  window RTS smoother (Fix 2), the hand path gate (Fix 3), and the ground
-//  plane stage (Fix 4). Zero defaults throughout, so records written by
-//  every previous build decode unchanged and read "feature never ran".
-//
-//  SKELETON INTEGRITY ADDITIONS. Two counters for the frame-audit fixes in
-//  PosePrior: the grip cluster anchor (a weak, held wrist drawn back to
-//  grip distance from its confidently tracked partner) and the shoulder
-//  medial collapse guard (a shoulder convicted on geometry, not
-//  visibility, and re-placed by the rigid-torso projection). Zero defaults
-//  throughout, same decode guarantee as every section above.
-//
-//  OCCLUSION OVERHAUL ADDITIONS. The midpoint magnet is removed from the
-//  pipeline; its counter stays below so historical records decode and new
-//  ones honestly read zero. Its replacements each get a field: the wrist
-//  occlusion rejection in LandmarkCleanup (count plus the bar actually
-//  applied, so a clip where the adaptive valve engaged says so), the
-//  shoulder occlusion projection in PosePrior, and the extended ground
-//  stage's ankle anchor and foot depth flattening. Zero and false defaults
-//  throughout, same decode guarantee as every section above.
-//
-//  ROUND FOUR ADDITIONS (DTL + face-on overhaul). Six fields, nothing
-//  removed: the toe pivot plant, the knee depth-consistency stage, the arm
-//  identity rejection, the background palm-lock rejection, the bone
-//  impossibility floor, and the routed view label. Zero and empty defaults
-//  throughout, same decode guarantee as every section above.
-//
-//  Codable so it can ride on UploadProcessor.Result, be logged to disk, and
-//  eventually be persisted with the record if a schema bump wants it.
-//
 //  House rule: no em dashes anywhere.
 //
 
@@ -80,254 +31,294 @@ public struct TrackingQC: Codable, Hashable {
 
     // MARK: - Cleanup
 
-    /// The per-clip visibility floor the cleanup derived (Vector H). Samples
-    /// below it were treated as missing. Zero when visibility data was absent
-    /// (the Vision backend) and the floor never ran.
+    /// The per-clip visibility floor the cleanup derived. Samples below it
+    /// were treated as missing. Zero when visibility data was absent and the
+    /// floor never ran.
     public var trustFloor: Double = 0
-    /// Per joint: fraction of grid frames where the joint was actually
-    /// measured, as opposed to gap filled or held. 1.0 is a fully tracked
-    /// joint; 0.0 is a joint the backend never reported (Vision heels).
+
+    /// Per joint: fraction of grid frames where the joint was measured.
     public var jointFillFraction: [Int: Double] = [:]
-    /// Per joint: mean reported visibility across measured samples. Empty for
-    /// backends with no per-joint confidence.
+
+    /// Per joint: mean reported visibility across measured samples.
     public var jointMeanVisibility: [Int: Double] = [:]
-    /// Samples rejected as outliers (velocity spikes, bone-length breaks,
-    /// arm-geometry breaks) and re-filled.
+
+    /// Samples rejected as outliers and re-filled.
     public var outliersRejected: Int = 0
+
     /// Interior gaps of at most the short-gap limit, filled by PCHIP.
     public var shortGapsFilled: Int = 0
-    /// Longer runs (and clip edges) filled by holding the last known value.
+
+    /// Longer runs and clip edges filled by holding the last known value.
     public var longGapsHeld: Int = 0
 
-    // MARK: - Smoothing (Task 1)
+    // MARK: - Smoothing
 
-    /// Which smoothing configuration ran: "uniform" (the pass-1 and fallback
-    /// form) or "scheduled" (the speed and phase scheduled Phase 2 form).
+    /// Which smoothing configuration ran: "uniform" or "scheduled".
     public var smoothingMode: String = ""
-    /// The band the schedule ran across, in Hz, low end (quietest joint at
-    /// the quietest moment) to high end (wrists through impact). Zero when
-    /// the smoothing was uniform.
+
+    /// The scheduled low cutoff in Hz.
     public var scheduledCutoffLowHz: Double = 0
+
+    /// The scheduled high cutoff in Hz.
     public var scheduledCutoffHighHz: Double = 0
 
-    // MARK: - Golfer selection (Task 2)
+    // MARK: - Golfer selection
 
     /// Frames where the detector returned more than one candidate person.
     public var framesWithMultipleCandidates: Int = 0
-    /// Candidate detections excluded from selection because their bounding
-    /// box sat under the minimum area floor (background people).
+
+    /// Candidate detections excluded because their box sat under the area floor.
     public var backgroundCandidatesExcluded: Int = 0
-    /// Frames where nobody cleared the visibility bar and the golfer was
-    /// chosen by the largest-person fallback (either tier).
+
+    /// Frames where selection fell back to the largest-person rule.
     public var selectionFallbackFrames: Int = 0
-    /// Mean and minimum bounding-box area of the selected golfer, as a
-    /// fraction of the frame. A low minimum on an otherwise large mean is
-    /// the signature of a one-frame jump onto a background person.
+
+    /// Mean selected golfer bounding-box area as a fraction of frame.
     public var golferAreaMean: Double = 0
+
+    /// Minimum selected golfer bounding-box area as a fraction of frame.
     public var golferAreaMin: Double = 0
 
-    // MARK: - Video 2 Audit: Background Person Selection Rules
+    // MARK: - Background person selection rules
 
-    /// Candidates rejected because their bounding box area fell below the
-    /// minimum area ratio threshold (0.35 × golfer baseline area).
+    /// Candidates rejected by area-ratio gating.
     public var candidatesRejectedByAreaRatio: Int = 0
-    /// Candidates rejected because their torso centroid jumped more than
-    /// 0.15 normalized units per frame step from the previous selection.
+
+    /// Candidates rejected by continuity gating.
     public var candidatesRejectedByContinuity: Int = 0
-    /// The baseline bounding box area of the golfer (as a fraction of frame)
-    /// computed from the first 5 confident picks. Used as the reference for
-    /// the area ratio threshold.
+
+    /// Baseline golfer bounding-box area as a fraction of frame.
     public var golferBaselineArea: Double = 0
-    /// Frames where the ROI crop was active (pipeline constrained detection
-    /// to the golfer's bounding box + 15% margin).
+
+    /// Frames where ROI crop was active.
     public var roiCroppedFrames: Int = 0
 
     // MARK: - Prior
 
-    /// Frames where a bone was projected back toward the clip's median length.
+    /// Frames where a bone was projected back toward its median length.
     public var priorBoneCorrections: Int = 0
-    /// Frames where an implausibly folded joint was relaxed toward its own
-    /// trajectory.
+
+    /// Frames where an implausibly folded joint was relaxed.
     public var priorRangeCorrections: Int = 0
+
     /// Frames where the two wrists were fused into a grip point.
     public var gripFramesFused: Int = 0
 
-    // MARK: - Video 1 Audit: Hand Collapse Guard
+    // MARK: - Hand collapse guard
 
-    /// Frames where the hand collapse guard in LandmarkCleanup flagged the
-    /// index and pinky knuckles as missing (rejection form). These frames
-    /// were bridged by PCHIP gap filling.
+    /// Hand collapse samples rejected in LandmarkCleanup.
     public var handCollapseRejections: Int = 0
-    /// Frames where the hand collapse guard in PosePrior corrected the palm
-    /// centre position (reconstruction form). The palm was pushed back out
-    /// along the forearm direction to the clip-median separation.
+
+    /// Hand collapse samples corrected in PosePrior.
     public var handCollapseCorrections: Int = 0
 
-    // MARK: - Midpoint constraint (Task 3, RETIRED)
+    // MARK: - Midpoint constraint, retired
 
-    /// RETIRED by the occlusion overhaul: the midpoint magnet is removed
-    /// from the pipeline. The field stays so records written while it ran
-    /// still decode and still say what happened to them; new records
-    /// honestly read zero, this file's own "feature never ran" convention.
+    /// Retired field kept for historical decode compatibility.
     public var midpointCorrections: Int = 0
 
     // MARK: - Occlusion overhaul
 
-    /// Wrist samples rejected by the visibility bar in LandmarkCleanup and
-    /// bridged or held by the standard gap fill.
+    /// Wrist samples rejected by the visibility bar.
     public var wristOcclusionRejections: Int = 0
-    /// The weakest visibility bar actually applied across the two wrists.
-    /// Equal to the configured 0.6 on a well tracked clip; lower when the
-    /// adaptive valve engaged to keep the clip from being hollowed out.
-    /// Zero when the stage never ran (no visibility data, or disabled).
+
+    /// Weakest wrist visibility floor actually applied.
     public var wristVisibilityFloorApplied: Double = 0
-    /// Frames where an occluded shoulder was re-placed from the visible
-    /// shoulder, the hips and the clip's rigid-torso geometry.
+
+    /// Frames where an occluded shoulder was projected from torso geometry.
     public var shoulderProjectionFrames: Int = 0
-    /// Ankle samples clamped or blended onto the ankle's own clip-measured
-    /// level above the turf.
+
+    /// Ankle samples clamped or blended onto their clip-measured turf level.
     public var ankleGroundAnchors: Int = 0
-    /// True when foot depth was flattened to clip medians this run.
+
+    /// True when foot depth was flattened to clip medians.
     public var footDepthFlattened: Bool = false
 
     // MARK: - Skeleton integrity pass
 
-    /// Frames where the grip cluster anchor (Fix G) drew a weak wrist (a
-    /// hold or a deeply dimmed sample) back to grip distance from its
-    /// confidently tracked partner. A large number on a DTL clip is the
-    /// occluded crossing wrist story told honestly; zero on a face-on
-    /// clip is the hoped-for reading.
+    /// Frames where the grip cluster anchor corrected a weak wrist.
     public var gripClusterFrames: Int = 0
-    /// Frames where the shoulder medial collapse guard convicted a
-    /// shoulder on geometry (a one sided shoulder to hip ratio spike plus
-    /// a one sided rigid-torso disagreement) and the projection re-placed
-    /// it regardless of its reported visibility. A subset, conceptually,
-    /// of the failures shoulderProjectionFrames counts, kept separate so
-    /// a clip where the visibility bar missed everything says so.
+
+    /// Frames where shoulder medial collapse was corrected.
     public var shoulderCollapseFrames: Int = 0
 
-    // MARK: - Crop refinement (Task 4)
+    // MARK: - Crop refinement
 
-    /// Grid frames inside the P4 to P8 window the crop pass attempted.
+    /// Grid frames inside the attempted crop-refinement window.
     public var cropFramesAttempted: Int = 0
-    /// Frames where at least one joint was actually refined from the crop.
+
+    /// Frames where at least one joint was refined from the crop.
     public var cropFramesRefined: Int = 0
+
     /// Individual joint samples merged from the crop detection.
     public var cropJointSamplesMerged: Int = 0
 
-    // MARK: - GMM prior (Task 5)
+    // MARK: - GMM prior
 
-    /// Frames the loaded GMM scored. Zero when no model file shipped, which
-    /// is the honest state until the dataset exists and training has run.
+    /// Frames the loaded GMM scored.
     public var gmmFramesEvaluated: Int = 0
-    /// Frames pulled toward a plausible configuration because their
-    /// log-likelihood sat below the trained threshold.
+
+    /// Frames corrected by the GMM prior.
     public var gmmCorrections: Int = 0
 
-    // MARK: - Torso constraints (OnForm parity, Fix 1)
+    // MARK: - Torso constraints
 
-    /// Frames where a world shoulder or hip width was projected back toward
-    /// its clip median (past the ten percent tolerance).
+    /// Frames where shoulder or hip width was corrected.
     public var torsoWidthCorrections: Int = 0
-    /// Frames, in either space, where the shoulder to hip width ratio was
-    /// corrected toward its clip median. This is the glitch detector: honest
-    /// foreshortening shrinks both widths together and never trips it.
+
+    /// Frames where shoulder-to-hip width ratio was corrected.
     public var torsoRatioCorrections: Int = 0
 
-    // MARK: - Occlusion smoothing (OnForm parity, Fix 2)
+    // MARK: - Occlusion smoothing
 
-    /// Occlusion windows (per joint, per space) the RTS smoother processed:
-    /// runs where visibility sat under 0.3 long enough to matter.
+    /// Occlusion windows processed by the RTS smoother.
     public var occlusionWindowsSmoothed: Int = 0
-    /// Unique grid frames inside those windows' occluded cores. A large
-    /// number here on a DTL clip is the lead arm story told honestly.
+
+    /// Unique grid frames inside smoothed occlusion windows.
     public var occlusionFramesSmoothed: Int = 0
 
-    // MARK: - Hand path gate (OnForm parity, Fix 3)
+    // MARK: - Hand path gate
 
-    /// Where the velocity trigger opened the hand path and where the quiet
-    /// run past P8 closed it, as grid frame indices. activeFrames of zero
-    /// means the gate never ran or never opened; the samples themselves
-    /// travel on Result.handPath.
+    /// Frame where hand path gate opened.
     public var handPathStartFrame: Int = 0
+
+    /// Frame where hand path gate closed.
     public var handPathStopFrame: Int = 0
+
+    /// Number of active hand path frames.
     public var handPathActiveFrames: Int = 0
 
-    // MARK: - Ground plane (OnForm parity, Fix 4)
+    // MARK: - Ground plane
 
     /// Near-plane heel and toe samples anchored onto the turf.
     public var groundPlaneSnaps: Int = 0
-    /// Foot samples that sat below the turf and were clamped back to it.
+
+    /// Foot samples below turf clamped back to it.
     public var groundPenetrationsClamped: Int = 0
-    /// Frames where the lead or trail heel sat clearly above its plane: the
-    /// heel lift, detected and respected rather than fought.
+
+    /// Lead heel lift frames.
     public var heelLiftFramesLead: Int = 0
+
+    /// Trail heel lift frames.
     public var heelLiftFramesTrail: Int = 0
 
-    // MARK: - Round four: DTL + face-on overhaul
+    // MARK: - Round four: DTL and face-on overhaul
 
-    /// Frames where the toe pivot plant in the ground stage held a lifted
-    /// heel's toe at exact turf level (tolerance zero during the lift).
-    /// Should sit at the same order of magnitude as heelLiftFramesLead and
-    /// heelLiftFramesTrail on a clip with a real pivot; the pairing is the
-    /// stage validating itself.
+    /// Frames where toe pivot plant held a lifted heel's toe at turf level.
     public var toePivotPlants: Int = 0
-    /// Frames where the knee depth-consistency stage undid a mirrored knee
-    /// z (the sign of knee minus same-side-hip depth inverting in one frame
-    /// while the hip stayed put). Well under its 20 percent per-knee cap on
-    /// a healthy clip; pinned at the cap means the clip was flagged, not
-    /// rewritten.
+
+    /// Frames where mirrored knee depth was corrected.
     public var kneeDepthFlipsCorrected: Int = 0
-    /// Wrist and elbow samples rejected by the arm identity checks in
-    /// LandmarkCleanup (a wrist genuinely sitting on the other arm, an
-    /// elbow cross-linked onto the other upper arm). Near zero on a healthy
-    /// clip of either view is the required negative result; the gripped
-    /// pose must never light this up.
+
+    /// Wrist and elbow samples rejected by arm identity checks.
     public var armIdentityRejections: Int = 0
-    /// Knuckle samples rejected by the background palm-lock check in
-    /// LandmarkCleanup (a knuckle that jumped to a background object past
-    /// hand distance and parked there). Zero except on clips with the
-    /// audited white-hat style failure.
+
+    /// Knuckle samples rejected by background palm-lock checks.
     public var backgroundLockRejections: Int = 0
-    /// Limb bone samples rejected by the impossibility floor in
-    /// LandmarkCleanup: a per-frame length under the anatomically
-    /// impossible fraction of its own clip median, past what the
-    /// proportional tolerance could excuse. Separate from outliersRejected
-    /// attribution so the audit clips can show whether the old proportional
-    /// path or the new floor fired.
+
+    /// Limb bone samples rejected by the impossibility floor.
     public var boneImpossibleRejections: Int = 0
-    /// The swing view the pipeline actually routed on ("faceOn",
-    /// "downTheLine"), whether preclassified by the orchestrator or
-    /// self-classified by the corrector. Empty when no view-aware stage
-    /// ran, this file's own "feature never ran" convention.
+
+    /// Routed swing view label: "faceOn" or "downTheLine".
     public var detectedViewLabel: String = ""
+
+    // MARK: - Round five advanced fixes
+
+    /// Address-reference grid frames available to downstream reference stages.
+    public var addressReferenceFrames: Int = 0
+
+    /// Stillness score of the captured address reference window.
+    public var addressReferenceStillness: Double = 0
+
+    /// Bone-length constants sourced from the address reference.
+    public var referenceBoneLengthsUsed: Int = 0
+
+    /// Joint-angle priors sourced from the address reference.
+    public var referenceJointAnglesUsed: Int = 0
+
+    /// Reference constants accepted by the resolver.
+    public var referenceConstantsUsed: Int = 0
+
+    /// Reference constants rejected because confidence, stability, or geometry
+    /// checks failed.
+    public var referenceConstantsRejected: Int = 0
+
+    /// Occlusion RTS windows whose process noise was scaled by joint velocity.
+    public var velocityAwareRTSWindows: Int = 0
+
+    /// Individual frames inside RTS windows where velocity scaling boosted the
+    /// process noise above the base value.
+    public var rtsVelocityBoostedFrames: Int = 0
+
+    /// Body-level centre-of-mass frames evaluated by the cleanup stage.
+    public var comFramesEvaluated: Int = 0
+
+    /// Body-level centre-of-mass discontinuities detected.
+    public var comJumpsDetected: Int = 0
+
+    /// Individual joint samples rejected due to centre-of-mass attribution.
+    public var comRejections: Int = 0
+
+    /// Frames where the damped Levenberg-Marquardt IK solver accepted an update.
+    public var ikFramesSolved: Int = 0
+
+    /// Individual joint samples changed by accepted IK solves.
+    public var ikJointCorrections: Int = 0
+
+    /// Frames where IK was attempted but rejected or failed.
+    public var ikSolverFailures: Int = 0
+
+    /// Mean fractional residual reduction across accepted IK frames.
+    public var ikMeanResidualReduction: Double = 0
+
+    /// Occlusion windows processed with the constant-acceleration Kalman path.
+    public var constantAccelWindowsSmoothed: Int = 0
+
+    /// Compatibility counter for the constant-acceleration Kalman path.
+    /// Kept separate because AdaptiveSmoothing writes this shorter name.
+    public var constantAccelWindows: Int = 0
+
+    /// Grid-frame samples inside constant-acceleration Kalman windows.
+    public var constantAccelFramesSmoothed: Int = 0
+
+    /// Frames where the spine or trunk hypergraph corrected geometry.
+    public var spineLengthCorrections: Int = 0
+
+    /// Frames where bilateral symmetry hypergraph corrected geometry.
+    public var bilateralSymmetryCorrections: Int = 0
+
+    /// Frames where bilateral body constants were reconciled toward a shared
+    /// reference-consistent value.
+    public var bilateralSymmetryReconciled: Int = 0
 
     // MARK: - Phases
 
-    /// Mean frame confidence within each phase window, keyed by the phase raw
-    /// value ("p1" through "p10"). Filled after analysis, since phases do not
-    /// exist until the refined frames have been segmented.
+    /// Mean frame confidence within each phase window, keyed by raw phase value.
     public var phaseConfidence: [String: Double] = [:]
 
     public init() {}
 
     /*
       Mean frame confidence per phase window. The window for a phase runs from
-      its index up to (not including) the next phase's index; the last phase
-      runs to the end of the clip. Uses the same Frame.conf the validity gate
-      reads, so the two agree about what confidence means.
+      its index up to, but not including, the next phase's index. The last phase
+      runs to the end of the clip.
     */
     public mutating func fillPhaseConfidence(frames: [Frame], phases: PhaseResult) {
         guard !frames.isEmpty else { return }
+
         let ordered = Phases.PHASE_KEYS
         for (k, key) in ordered.enumerated() {
             guard let start = phases.idx[key] else { continue }
+
             let end: Int
-            if k + 1 < ordered.count, let next = phases.idx[ordered[k + 1]], next > start {
+            if k + 1 < ordered.count,
+               let next = phases.idx[ordered[k + 1]],
+               next > start {
                 end = min(next, frames.count)
             } else {
                 end = frames.count
             }
+
             let lo = max(0, min(start, frames.count - 1))
             let hi = max(lo + 1, min(end, frames.count))
             let window = frames[lo..<hi]

@@ -157,6 +157,14 @@ public final class TemporalSmoothingService {
             /// per-sample variance (around 1e-5 for a couple of millipixels
             /// of jitter at typical framing).
             case kalman(processNoise: Double, measurementNoise: Double)
+            /// Round five: the constant-ACCELERATION sibling, state
+            /// [position, velocity, acceleration], for callers
+            /// experimenting with the polish over fast stretches. Not
+            /// installed by any factory: the polish is speed gated, so it
+            /// owns the address and the finish, where a third state has
+            /// nothing to estimate. The load-bearing use of this model is
+            /// in OcclusionRTSSmoother, on the crossing windows.
+            case kalmanCA(processNoise: Double, measurementNoise: Double)
         }
 
         public var kind: Kind
@@ -652,6 +660,12 @@ public final class TemporalSmoothingService {
                 processNoise: Swift.max(q, 1e-9),
                 measurementNoise: Swift.max(r, 1e-12)
             )
+        case .kalmanCA(let q, let r):
+            polished = Self.kalmanCARTS(
+                channel, dt: 1 / fs,
+                processNoise: Swift.max(q, 1e-9),
+                measurementNoise: Swift.max(r, 1e-12)
+            )
         }
         guard let gate else { return polished }
         var out = channel
@@ -792,6 +806,26 @@ public final class TemporalSmoothingService {
             }
             out[k] = sx0
         }
+        return out
+    }
+
+    /*
+      Round five: the whole-channel spelling of the three-state smoother,
+      for the optional kalmanCA final pass. Constant q and r, no ramp, so
+      it is OcclusionRTSSmoother's window smoother over the full range.
+      Reused rather than re-implemented so the two halves cannot drift.
+    */
+    private static func kalmanCARTS(
+        _ z: [Double], dt: Double, processNoise q: Double, measurementNoise r: Double
+    ) -> [Double] {
+        let n = z.count
+        guard n > 3, dt > 0 else { return z }
+        var out = z
+        OcclusionRTSSmoother.smoothWholeChannelCA(
+            &out, dt: dt,
+            q: [Double](repeating: q, count: n),
+            r: [Double](repeating: r, count: n)
+        )
         return out
     }
 
@@ -1019,6 +1053,65 @@ public final class OcclusionRTSSmoother {
         /// floor down, so trust falls away smoothly rather than stepping.
         public var occludedNoiseBoost: Double = 400
 
+        /*
+          ROUND FIVE (P0). Velocity-aware process noise.
+
+          q in a constant-velocity model is the white-acceleration
+          spectral density: how much the joint's velocity may change
+          between samples. A wrist changes velocity by nothing at address
+          and by several g through transition, so one clip-wide number
+          cannot describe both, and the round-four view factory below is
+          a workaround for that: it splits q by CAMERA ANGLE when the
+          quantity q should actually track is the SPEED OF THE JOINT at
+          that instant.
+
+          The multiplier is exactly 1.0 at zero speed, so a still joint
+          gets today's q to the bit and the DTL quiet holds, where the
+          audit says the current tuning is right, are untouched. Only the
+          fast windows loosen.
+        */
+        public var velocityAware: Bool = true
+        /// Speed at which the process noise doubles, per space. World
+        /// figure sits just above the hand collapse guard's own 4.0 m/s
+        /// "fast enough to break the tracker" gate; the norm figure sits
+        /// just below that guard's 1.2 image-space gate, so q is already
+        /// loosening as the hand enters the window where tracking fails.
+        public var velocityReferenceNorm: Double = 0.8
+        public var velocityReferenceWorld: Double = 5.0
+        /// Slope of the ramp. 1.0 means a joint at the reference speed
+        /// gets twice the base process noise. Linear rather than
+        /// quadratic: the modelled quantity is acceleration variance,
+        /// which grows roughly linearly with speed through a swing.
+        public var velocityGain: Double = 1.0
+        /// Ceiling. Past about eight times base, a reconstructed window
+        /// starts re-inheriting the teleports the smoother exists to
+        /// remove.
+        public var maxVelocityMultiplier: Double = 8.0
+
+        /*
+          ROUND FIVE (P1). Constant-acceleration state for fast windows.
+
+          The face-on audit's "wrists and palms project forward into
+          future frames" is the signature of a constant-VELOCITY model
+          asked to bridge an accelerating stretch: the forward pass can
+          only draw a straight coast at the entry velocity, and the RTS
+          backward pass then bends that straight line to meet the exit
+          sample, which overshoots in the middle. On a hand tracing the
+          release arc, that overshoot IS the hand appearing ahead of
+          itself. A third state curves instead.
+
+          Chosen per window rather than per clip: a long, still DTL hold
+          has no acceleration to estimate and a third state there only
+          adds variance, so those windows keep the two-state path exactly.
+        */
+        public var constantAccel: Bool = true
+        /// Fraction of the space's velocity reference above which a
+        /// window's MEAN speed selects the three-state model. 0.6 is
+        /// about 3 m/s in world space: unambiguously downswing or
+        /// release, but low enough to catch the whole crossing window
+        /// rather than only its fastest frames.
+        public var constantAccelSpeedFraction: Double = 0.6
+
         public init() {}
 
         /*
@@ -1065,6 +1158,13 @@ public final class OcclusionRTSSmoother {
 
         var framesTouched = Set<Int>()
         var windows = 0
+        // Round five: unique grid frames where the velocity ramp raised
+        // the process noise by at least half again over base, which is
+        // the honest definition of "the velocity awareness did something
+        // here", and the count of windows that selected the three-state
+        // constant-acceleration model.
+        var velocityBoosted = Set<Int>()
+        var constantAccelWindows = 0
 
         for space in [PoseSpace.norm, PoseSpace.world] {
             var bank = timeline.channels(space)
@@ -1095,15 +1195,58 @@ public final class OcclusionRTSSmoother {
                     r[i] = rBase * (1 + config.occludedNoiseBoost * t * t)
                 }
 
+                // ROUND FIVE (P0): per-sample PROCESS noise, scaled by how
+                // fast this joint is actually moving. See the config note.
+                // All base when the feature is off or the joint never
+                // moves, in which case the arithmetic below is identical
+                // to multiplying by the scalar q, to the bit.
+                let vRef = space == .norm
+                    ? config.velocityReferenceNorm
+                    : config.velocityReferenceWorld
+                let qSeries = Self.processNoiseSeries(
+                    x: bank.x[joint], y: bank.y[joint],
+                    z: bank.z[joint].allSatisfy({ $0.isFinite }) ? bank.z[joint] : nil,
+                    times: timeline.times, base: q,
+                    reference: vRef, gain: config.velocityGain,
+                    ceiling: config.maxVelocityMultiplier,
+                    enabled: config.velocityAware
+                )
+                if config.velocityAware {
+                    for i in 0..<n where qSeries[i] > q * 1.5 { velocityBoosted.insert(i) }
+                }
+
                 for range in ranges {
                     windows += 1
                     for i in range where occluded[i] { framesTouched.insert(i) }
 
                     let ramp = Self.crossfade(range: range, occluded: occluded, pad: config.pad)
-                    Self.smoothWindow(&bank.x[joint], range: range, dt: dt, q: q, r: r, ramp: ramp)
-                    Self.smoothWindow(&bank.y[joint], range: range, dt: dt, q: q, r: r, ramp: ramp)
-                    if bank.z[joint].allSatisfy({ $0.isFinite }) {
-                        Self.smoothWindow(&bank.z[joint], range: range, dt: dt, q: q, r: r, ramp: ramp)
+
+                    // Round five (P1): three states when this window is
+                    // fast enough for the joint to be accelerating hard,
+                    // two when it is not. The mean is over the window's
+                    // own gain series, which is speed over the reference
+                    // plus one, so subtracting one and dividing by the
+                    // gain recovers the speed ratio without recomputing it.
+                    var ratioSum = 0.0
+                    for i in range {
+                        ratioSum += Swift.max(qSeries[i] / q - 1, 0) / Swift.max(config.velocityGain, 1e-9)
+                    }
+                    let meanRatio = ratioSum / Double(range.count)
+                    let useCA = config.constantAccel && meanRatio > config.constantAccelSpeedFraction
+
+                    if useCA {
+                        constantAccelWindows += 1
+                        Self.smoothWindowCA(&bank.x[joint], range: range, dt: dt, q: qSeries, r: r, ramp: ramp)
+                        Self.smoothWindowCA(&bank.y[joint], range: range, dt: dt, q: qSeries, r: r, ramp: ramp)
+                        if bank.z[joint].allSatisfy({ $0.isFinite }) {
+                            Self.smoothWindowCA(&bank.z[joint], range: range, dt: dt, q: qSeries, r: r, ramp: ramp)
+                        }
+                    } else {
+                        Self.smoothWindow(&bank.x[joint], range: range, dt: dt, q: qSeries, r: r, ramp: ramp)
+                        Self.smoothWindow(&bank.y[joint], range: range, dt: dt, q: qSeries, r: r, ramp: ramp)
+                        if bank.z[joint].allSatisfy({ $0.isFinite }) {
+                            Self.smoothWindow(&bank.z[joint], range: range, dt: dt, q: qSeries, r: r, ramp: ramp)
+                        }
                     }
                 }
             }
@@ -1115,6 +1258,8 @@ public final class OcclusionRTSSmoother {
         // the two numbers answer different questions on purpose.
         qc.occlusionWindowsSmoothed += windows
         qc.occlusionFramesSmoothed += framesTouched.count
+        qc.rtsVelocityBoostedFrames += velocityBoosted.count
+        qc.constantAccelWindows += constantAccelWindows
     }
 
     /// Occlusion runs of at least minRun, padded by pad frames each side,
@@ -1170,6 +1315,249 @@ public final class OcclusionRTSSmoother {
     }
 
     /*
+      Per-sample process noise for one joint's channel set.
+
+      Speed is a CENTRAL DIFFERENCE over the real timestamps, so a
+      non-uniform grid cannot bias it, and it is computed on the channel
+      as it stands entering the smoother. Inside an occlusion window those
+      positions are exactly the untrustworthy ones, which is fine and in
+      fact desirable: a teleporting sample reads as very fast, the model
+      loosens there, and the filter is freed to move rather than being
+      dragged into a compromise between the teleport and the coast. The
+      measurement noise ramp (r in the caller) is what refuses to BELIEVE
+      the teleport; this ramp only refuses to be surprised by motion.
+
+      The gain series is then averaged over five taps, because a step in q
+      steps the Kalman gain and prints a visible kink at the step frame,
+      the same reason the schedule in TemporalSmoothingService is itself
+      low-passed before use.
+
+      Returns an array of base when disabled or when the channel is too
+      short to differentiate, so the caller's arithmetic is unchanged.
+    */
+    private static func processNoiseSeries(
+        x: [Double], y: [Double], z: [Double]?,
+        times: [Double], base: Double,
+        reference: Double, gain: Double, ceiling: Double,
+        enabled: Bool
+    ) -> [Double] {
+        let n = x.count
+        guard enabled, n > 2, y.count == n, times.count == n, reference > 1e-9 else {
+            return [Double](repeating: base, count: n)
+        }
+
+        var speed = [Double](repeating: 0, count: n)
+        for i in 0..<n {
+            let lo = Swift.max(0, i - 1)
+            let hi = Swift.min(n - 1, i + 1)
+            let dt = (times[hi] - times[lo]) / 1000
+            guard dt > 1e-4,
+                  x[lo].isFinite, x[hi].isFinite, y[lo].isFinite, y[hi].isFinite else { continue }
+            let dx = x[hi] - x[lo], dy = y[hi] - y[lo]
+            var d2 = dx * dx + dy * dy
+            if let z, z[lo].isFinite, z[hi].isFinite {
+                let dz = z[hi] - z[lo]
+                d2 += dz * dz
+            }
+            speed[i] = d2.squareRoot() / dt
+        }
+
+        var g = [Double](repeating: 1, count: n)
+        for i in 0..<n {
+            g[i] = Geometry.clamp(1 + gain * (speed[i] / reference), 1, Swift.max(ceiling, 1))
+        }
+
+        // Five-tap box average, edges clamped. Cheap and enough: the job
+        // is to remove the step, not to shape a response.
+        var smoothed = [Double](repeating: 1, count: n)
+        for i in 0..<n {
+            var sum = 0.0
+            var count = 0
+            for k in (i - 2)...(i + 2) {
+                let idx = Swift.min(Swift.max(k, 0), n - 1)
+                sum += g[idx]
+                count += 1
+            }
+            smoothed[i] = sum / Double(count)
+        }
+        return smoothed.map { base * $0 }
+    }
+
+    /*
+      One channel through one window, CONSTANT ACCELERATION.
+
+      State is [position, velocity, acceleration]; Q is the standard
+      white-jerk form. Everything else matches smoothWindow exactly: the
+      same per-sample measurement variance, the same per-sample process
+      noise, the same RTS backward pass, the same ramp blend. The third
+      state is the only difference and it is the whole point: a
+      constant-velocity model bridging an accelerating stretch can only
+      draw a straight coast, and the backward pass bending that coast to
+      meet the exit sample is what the face-on audit sees as the hand
+      projecting into future frames.
+
+      The 3 by 3 algebra is written out scalar, like the 2 by 2 above, so
+      there is nothing to allocate per sample beyond the per-step state
+      rows. The RTS gain needs the inverse of the predicted covariance,
+      taken by adjugate over the determinant with the same singularity
+      guard the two-state version uses: on a singular system the smoothed
+      estimate falls back to the filtered one, which is the honest answer.
+    */
+    static func smoothWindowCA(
+        _ channel: inout [Double], range: ClosedRange<Int>,
+        dt: Double, q: [Double], r: [Double], ramp: [Double]
+    ) {
+        let z = Array(channel[range])
+        let rw = Array(r[range])
+        let qw = Array(q[range])
+        let n = z.count
+        guard n > 3, dt > 0, qw.count == n else { return }
+
+        // Filtered and predicted state and covariance per step, for the
+        // backward pass. Each covariance is a row-major 3 by 3 in nine
+        // flat Doubles.
+        var fx = [[Double]](repeating: [0, 0, 0], count: n)
+        var px = [[Double]](repeating: [0, 0, 0], count: n)
+        var fp = [[Double]](repeating: [Double](repeating: 0, count: 9), count: n)
+        var pp = [[Double]](repeating: [Double](repeating: 0, count: 9), count: n)
+
+        var x = [z[0], 0.0, 0.0]
+        var p = [rw[0] * 10, 0, 0,
+                 0, 1.0, 0,
+                 0, 0, 1.0]
+
+        for k in 0..<n {
+            var ax = x
+            var ap = p
+            if k > 0 {
+                let qk = qw[k]
+                let d2 = dt * dt, d3 = d2 * dt, d4 = d3 * dt, d5 = d4 * dt
+                let q00 = qk * d5 / 20, q01 = qk * d4 / 8, q02 = qk * d3 / 6
+                let q11 = qk * d3 / 3, q12 = qk * d2 / 2, q22 = qk * dt
+
+                // xPred = F x
+                ax = [x[0] + dt * x[1] + 0.5 * d2 * x[2],
+                      x[1] + dt * x[2],
+                      x[2]]
+
+                // M = F P, then PPred = M F^T + Q, written out.
+                var m = [Double](repeating: 0, count: 9)
+                for c in 0..<3 {
+                    m[0 * 3 + c] = p[0 * 3 + c] + dt * p[1 * 3 + c] + 0.5 * d2 * p[2 * 3 + c]
+                    m[1 * 3 + c] = p[1 * 3 + c] + dt * p[2 * 3 + c]
+                    m[2 * 3 + c] = p[2 * 3 + c]
+                }
+                for rIdx in 0..<3 {
+                    let m0 = m[rIdx * 3 + 0], m1 = m[rIdx * 3 + 1], m2 = m[rIdx * 3 + 2]
+                    ap[rIdx * 3 + 0] = m0 + dt * m1 + 0.5 * d2 * m2
+                    ap[rIdx * 3 + 1] = m1 + dt * m2
+                    ap[rIdx * 3 + 2] = m2
+                }
+                ap[0] += q00; ap[1] += q01; ap[2] += q02
+                ap[3] += q01; ap[4] += q11; ap[5] += q12
+                ap[6] += q02; ap[7] += q12; ap[8] += q22
+            }
+
+            px[k] = ax
+            pp[k] = ap
+
+            // Update, H = [1, 0, 0].
+            let s = ap[0] + rw[k]
+            guard s > 1e-18 else { return }
+            let k0 = ap[0] / s, k1 = ap[3] / s, k2 = ap[6] / s
+            let innovation = z[k] - ax[0]
+            x = [ax[0] + k0 * innovation,
+                 ax[1] + k1 * innovation,
+                 ax[2] + k2 * innovation]
+
+            // P = (I - K H) PPred. K H has the gain in column 0 only, so
+            // row i of the product subtracts k_i times row 0 of PPred.
+            var np = [Double](repeating: 0, count: 9)
+            for c in 0..<3 {
+                np[0 * 3 + c] = ap[0 * 3 + c] - k0 * ap[c]
+                np[1 * 3 + c] = ap[1 * 3 + c] - k1 * ap[c]
+                np[2 * 3 + c] = ap[2 * 3 + c] - k2 * ap[c]
+            }
+            p = np
+
+            fx[k] = x
+            fp[k] = p
+        }
+
+        // RTS backward, means only.
+        var smoothed = [Double](repeating: 0, count: n)
+        var sx = fx[n - 1]
+        smoothed[n - 1] = sx[0]
+
+        for k in stride(from: n - 2, through: 0, by: -1) {
+            // A = Pf F^T.
+            let pf = fp[k]
+            var a = [Double](repeating: 0, count: 9)
+            for rIdx in 0..<3 {
+                let c0 = pf[rIdx * 3 + 0], c1 = pf[rIdx * 3 + 1], c2 = pf[rIdx * 3 + 2]
+                a[rIdx * 3 + 0] = c0
+                a[rIdx * 3 + 1] = dt * c0 + c1
+                a[rIdx * 3 + 2] = 0.5 * dt * dt * c0 + dt * c1 + c2
+            }
+
+            // inverse of PPred(k + 1), by adjugate over determinant.
+            let b = pp[k + 1]
+            let c00 = b[4] * b[8] - b[5] * b[7]
+            let c01 = b[2] * b[7] - b[1] * b[8]
+            let c02 = b[1] * b[5] - b[2] * b[4]
+            let c10 = b[5] * b[6] - b[3] * b[8]
+            let c11 = b[0] * b[8] - b[2] * b[6]
+            let c12 = b[2] * b[3] - b[0] * b[5]
+            let c20 = b[3] * b[7] - b[4] * b[6]
+            let c21 = b[1] * b[6] - b[0] * b[7]
+            let c22 = b[0] * b[4] - b[1] * b[3]
+            let det = b[0] * c00 + b[1] * c10 + b[2] * c20
+
+            if abs(det) > 1e-24 {
+                let inv = [c00 / det, c01 / det, c02 / det,
+                           c10 / det, c11 / det, c12 / det,
+                           c20 / det, c21 / det, c22 / det]
+                // C = A * inv
+                var cm = [Double](repeating: 0, count: 9)
+                for rIdx in 0..<3 {
+                    for cIdx in 0..<3 {
+                        var sum = 0.0
+                        for t in 0..<3 { sum += a[rIdx * 3 + t] * inv[t * 3 + cIdx] }
+                        cm[rIdx * 3 + cIdx] = sum
+                    }
+                }
+                let d0 = sx[0] - px[k + 1][0]
+                let d1 = sx[1] - px[k + 1][1]
+                let d2v = sx[2] - px[k + 1][2]
+                sx = [fx[k][0] + cm[0] * d0 + cm[1] * d1 + cm[2] * d2v,
+                      fx[k][1] + cm[3] * d0 + cm[4] * d1 + cm[5] * d2v,
+                      fx[k][2] + cm[6] * d0 + cm[7] * d1 + cm[8] * d2v]
+            } else {
+                sx = fx[k]
+            }
+            smoothed[k] = sx[0]
+        }
+
+        for (k, i) in range.enumerated() {
+            let w = k < ramp.count ? ramp[k] : 1
+            channel[i] = w * smoothed[k] + (1 - w) * channel[i]
+        }
+    }
+
+    /*
+      Full-channel wrapper, so TemporalSmoothingService's optional kalmanCA
+      final pass can reuse this algebra instead of a second copy of it.
+      Duplicating a filter is how two halves of a pipeline drift apart,
+      which is the same argument that made zeroPhaseLowPass public.
+    */
+    static func smoothWholeChannelCA(_ channel: inout [Double], dt: Double, q: [Double], r: [Double]) {
+        guard channel.count > 3 else { return }
+        let range = 0...(channel.count - 1)
+        smoothWindowCA(&channel, range: range, dt: dt, q: q, r: r,
+                       ramp: [Double](repeating: 1, count: channel.count))
+    }
+
+    /*
       One channel through one window: constant-velocity Kalman forward with
       per-sample measurement variance, RTS backward, blended in by the ramp.
       The algebra mirrors TemporalSmoothingService.kalmanRTS; the difference
@@ -1178,16 +1566,13 @@ public final class OcclusionRTSSmoother {
     */
     private static func smoothWindow(
         _ channel: inout [Double], range: ClosedRange<Int>,
-        dt: Double, q: Double, r: [Double], ramp: [Double]
+        dt: Double, q: [Double], r: [Double], ramp: [Double]
     ) {
         let z = Array(channel[range])
         let rw = Array(r[range])
+        let qw = Array(q[range])
         let n = z.count
-        guard n > 2, dt > 0 else { return }
-
-        let q00 = q * dt * dt * dt / 3
-        let q01 = q * dt * dt / 2
-        let q11 = q * dt
+        guard n > 2, dt > 0, qw.count == n else { return }
 
         var fx0 = [Double](repeating: 0, count: n)
         var fx1 = [Double](repeating: 0, count: n)
@@ -1216,6 +1601,14 @@ public final class OcclusionRTSSmoother {
                 ax0 = x0; ax1 = x1
                 ap00 = p00; ap01 = p01; ap10 = p10; ap11 = p11
             } else {
+                // Round five: the process noise for THIS step, so a fast
+                // stretch of the window is modelled as fast and a still
+                // one as still. q at sample k, because k is the sample
+                // whose motion this step has to explain.
+                let qk = qw[k]
+                let q00 = qk * dt * dt * dt / 3
+                let q01 = qk * dt * dt / 2
+                let q11 = qk * dt
                 ax0 = x0 + dt * x1
                 ax1 = x1
                 ap00 = p00 + dt * (p10 + p01) + dt * dt * p11 + q00

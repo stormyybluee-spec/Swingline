@@ -519,4 +519,144 @@ public enum Geometry {
         if value <= hHi { return Int((30 + 40 * ((hHi - value) / (hHi - oHi == 0 ? 1 : hHi - oHi))).rounded()) }
         return Int(clamp(30 - 30 * ((value - hHi) / (hHi == 0 ? 1 : hHi)), 0, 30).rounded())
     }
+
+    // MARK: - Body segment mass fractions (round five)
+
+    /*
+      Dempster's segment mass fractions, as fractions of total body mass.
+      The standard set, and the one the handoff's research table already
+      names. Used by the cleanup engine's centre-of-mass check, which is
+      the only whole-body consistency test in the pipeline.
+
+      The trunk is split into upper and lower rather than carried as one
+      0.497 mass, because the two halves are located by different landmark
+      pairs (shoulder midpoint and hip midpoint) and a single trunk mass
+      at their average would blur exactly the shoulder-versus-hip
+      disagreement the check is meant to see.
+
+      They sum to 1.000 by construction:
+        head 0.081 + upperTrunk 0.216 + lowerTrunk 0.281        = 0.578
+        2 x (upperArm 0.028 + forearm 0.016 + hand 0.006)       = 0.100
+        2 x (thigh 0.100 + shank 0.0465 + foot 0.0145)          = 0.322
+    */
+    public enum Dempster {
+        public static let head: Double = 0.081
+        public static let upperTrunk: Double = 0.216
+        public static let lowerTrunk: Double = 0.281
+        public static let upperArm: Double = 0.028
+        public static let forearm: Double = 0.016
+        public static let hand: Double = 0.006
+        public static let thigh: Double = 0.100
+        public static let shank: Double = 0.0465
+        public static let foot: Double = 0.0145
+
+        /*
+          The CORE set the cleanup check actually uses: head, both trunk
+          halves, both thighs, both shanks. 0.871 of body mass.
+
+          The arms are deliberately EXCLUDED. They are the most occluded,
+          most frequently rejected parts of any golf clip, so including
+          them would make the metric miss frames constantly and would add
+          the arms' own noise to a signal whose entire value is that it is
+          quieter than any single joint. The failures this check exists to
+          catch (a lock swap, a torso collapse, limbs clumping onto the
+          trunk) all move the core mass; none of them is invisible without
+          the arms.
+        */
+        public static let coreFractionSum: Double =
+            head + upperTrunk + lowerTrunk + 2 * thigh + 2 * shank
+    }
+
+    // MARK: - Linear algebra for the IK solve (round five)
+
+    /*
+      Solve A x = b for a symmetric positive definite A, by Cholesky
+      factorisation. A is row-major, n by n. Returns nil when A is not
+      positive definite, which for the IK's damped normal equations means
+      the damping was too small; the caller responds by raising lambda and
+      retrying, which is exactly what Levenberg-Marquardt does anyway.
+
+      Written here rather than reaching for Accelerate because the system
+      is 36 by 36 once per solved frame, the factorisation is a few
+      thousand flops, and a hand-written version has no dependency, no
+      layout ambiguity, and an explicit failure mode.
+    */
+    public static func choleskySolve(_ a: [Double], n: Int, rhs: [Double]) -> [Double]? {
+        guard n > 0, a.count == n * n, rhs.count == n else { return nil }
+
+        // L L^T = A, lower triangular.
+        var l = [Double](repeating: 0, count: n * n)
+        for i in 0..<n {
+            for j in 0...i {
+                var sum = a[i * n + j]
+                var k = 0
+                while k < j {
+                    sum -= l[i * n + k] * l[j * n + k]
+                    k += 1
+                }
+                if i == j {
+                    guard sum > 1e-14 else { return nil }
+                    l[i * n + i] = sum.squareRoot()
+                } else {
+                    let d = l[j * n + j]
+                    guard abs(d) > 1e-14 else { return nil }
+                    l[i * n + j] = sum / d
+                }
+            }
+        }
+
+        // Forward substitution, L y = rhs.
+        var y = [Double](repeating: 0, count: n)
+        for i in 0..<n {
+            var sum = rhs[i]
+            var k = 0
+            while k < i {
+                sum -= l[i * n + k] * y[k]
+                k += 1
+            }
+            y[i] = sum / l[i * n + i]
+        }
+
+        // Back substitution, L^T x = y.
+        var x = [Double](repeating: 0, count: n)
+        var i = n - 1
+        while i >= 0 {
+            var sum = y[i]
+            var k = i + 1
+            while k < n {
+                sum -= l[k * n + i] * x[k]
+                k += 1
+            }
+            x[i] = sum / l[i * n + i]
+            guard x[i].isFinite else { return nil }
+            i -= 1
+        }
+        return x
+    }
+
+    /*
+      Interior angle at b, in degrees, from nine flat coordinates. The
+      same quantity jointAngle(_:_:_:) returns for Vec3 arguments, in the
+      spelling the IK solve needs: the solver holds its state as a flat
+      [Double] and building three Vec3 values per hinge per finite
+      difference would allocate through the inner loop.
+
+      Returns 180 for a degenerate configuration (two of the three points
+      coincident). That is the right degenerate answer here: 180 degrees
+      is a fully extended joint, which violates no fold limit, so a
+      degenerate frame contributes no residual rather than a spurious one.
+    */
+    public static func interiorAngleDegrees(
+        _ ax: Double, _ ay: Double, _ az: Double,
+        _ bx: Double, _ by: Double, _ bz: Double,
+        _ cx: Double, _ cy: Double, _ cz: Double
+    ) -> Double {
+        let ux = ax - bx, uy = ay - by, uz = az - bz
+        let vx = cx - bx, vy = cy - by, vz = cz - bz
+        let lu = (ux * ux + uy * uy + uz * uz).squareRoot()
+        let lv = (vx * vx + vy * vy + vz * vz).squareRoot()
+        guard lu > 1e-9, lv > 1e-9 else { return 180 }
+        let c = clamp((ux * vx + uy * vy + uz * vz) / (lu * lv), -1, 1)
+        return deg(acos(c))
+    }
 }

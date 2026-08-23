@@ -374,6 +374,110 @@ public struct PhaseResult {
     }
 }
 
+// MARK: - Address reference (round five)
+
+/*
+  The address window: the stretch of frames before the takeaway where the
+  golfer stands still over the ball.
+
+  WHY IT EXISTS. Every body constant in the pipeline was a clip median,
+  and the stages that read those medians admit in their own comments that
+  the pool is polluted by the very failures they exist to correct. The
+  address window is the cleanest data in any clip: no motion blur, both
+  feet flat, nothing crossing anything, both hands visible on the handle.
+  Measuring the golfer's constants there and using them everywhere breaks
+  the circle where a failure calibrates its own detector.
+
+  WHY MILLISECONDS AND NOT FRAME INDICES. The provisional and refined
+  passes share a clock but not necessarily a grid: PoseTimeline caps the
+  resample rate at the clip's own measured rate and each pass re-cleans
+  from the raw frames independently. A window in milliseconds lands on
+  the same moments in both, so each consumer maps it onto its own grid
+  through frameIndices(in:).
+
+  Declared here rather than in PosePrior.swift because the orchestrator,
+  the corrector, the humanoid anchor and the upload Result all read it,
+  and this file's header rule applies: no engine file defines a type
+  another engine file needs.
+
+  House rule: no em dashes anywhere.
+*/
+public struct AddressReference: Codable, Hashable {
+
+    /// The window, inclusive, on the clip's own millisecond clock.
+    public var startMs: Double
+    public var endMs: Double
+
+    /// How still the window was: the median hand speed inside it as a
+    /// fraction of the clip's peak hand speed. Lower is better. A window
+    /// that passed capture sits under the capture config's ceiling.
+    public var stillness: Double
+
+    /// How many provisional-grid frames the window covered at capture,
+    /// for logging. The refined grid may count differently, which is
+    /// exactly why the window itself is stored in milliseconds.
+    public var frameCountAtCapture: Int
+
+    public init(startMs: Double, endMs: Double, stillness: Double, frameCountAtCapture: Int) {
+        self.startMs = startMs
+        self.endMs = endMs
+        self.stillness = stillness
+        self.frameCountAtCapture = frameCountAtCapture
+    }
+
+    public var durationMs: Double { endMs - startMs }
+
+    /*
+      The indices of a grid whose timestamps fall inside the window.
+      Empty when the grid and the window never overlap, in which case
+      every consumer behaves exactly as if no reference had been
+      captured, which is the required degradation path.
+    */
+    public func frameIndices(in times: [Double]) -> [Int] {
+        var out: [Int] = []
+        out.reserveCapacity(times.count / 4)
+        for (i, t) in times.enumerated() where t.isFinite && t >= startMs && t <= endMs {
+            out.append(i)
+        }
+        return out
+    }
+
+    /*
+      The capture rule's knobs. Held on the type rather than in
+      UploadProcessor so the numbers and the reasoning for them sit with
+      the thing they describe.
+    */
+    public struct CaptureConfig {
+        /// A frame is still when its hand speed is under this fraction of
+        /// the clip's peak hand speed. 0.12 because a waggle peaks well
+        /// above it (a waggle is a real, if small, swing of the club and
+        /// routinely reaches a fifth of downswing speed) while breathing,
+        /// a weight settle and a re-grip all sit well below.
+        public var maxSpeedFraction: Double = 0.12
+
+        /// The window must be at least this long to be believed. At 60 Hz
+        /// 200 ms is twelve frames, which is exactly the minimum sample
+        /// count the corrector's own reference gate demands, so a window
+        /// shorter than this could never be used anyway.
+        public var minDurationMs: Double = 200
+
+        /// And never longer than this. A golfer who stood over the ball
+        /// for four seconds was also walking in, settling and re-gripping,
+        /// and the frames nearest the takeaway describe the pose the swing
+        /// actually starts from. When a still run exceeds this, the LAST
+        /// maxDurationMs of it is taken.
+        public var maxDurationMs: Double = 1500
+
+        /// Where the search for the still run ends. When phases exist this
+        /// is P1; when they do not, the capture falls back to the first
+        /// frame whose speed crosses this fraction of peak, which is the
+        /// takeaway by any reasonable definition.
+        public var takeawaySpeedFraction: Double = 0.35
+
+        public init() {}
+    }
+}
+
 // MARK: - Sequencing
 
 public enum SegmentKey: String, Codable, Hashable, CaseIterable {

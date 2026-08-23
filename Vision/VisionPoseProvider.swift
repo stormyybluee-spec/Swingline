@@ -45,6 +45,14 @@ public final class VisionPoseProvider: PoseProvider {
     private let options: PoseProviderOptions
     private var closed = false
 
+    /// Optional contrast enhancement for the live Vision path. Default nil, so
+    /// capture is unchanged until a caller sets it. Lower priority than the
+    /// MediaPipe surfaces (this is the live fallback backend), but wired for
+    /// completeness so every detector input can be covered by one switch. The
+    /// live buffers arrive upright, so no orientation is applied, matching the
+    /// existing handler. See ImagePreprocessing.swift.
+    public var enhancer: PoseImageEnhancer?
+
     /*
       Live path stabilisation state.
 
@@ -148,7 +156,15 @@ public final class VisionPoseProvider: PoseProvider {
     public func detect(frame: CMSampleBuffer, timestampMs: Double) async throws -> [PersonDetection] {
         if closed { return [] }
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(frame) else { return [] }
-        let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, options: [:])
+        // Enhance into a fresh buffer and detect on that; the incoming buffer,
+        // which the preview reads, is never touched. Falls back to the raw
+        // buffer on any failure, so a frame is never lost to the filter.
+        let handler: VNImageRequestHandler
+        if let enhancer, let enhanced = enhancer.enhancedBuffer(from: frame) {
+            handler = VNImageRequestHandler(cvPixelBuffer: enhanced, options: [:])
+        } else {
+            handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, options: [:])
+        }
         let raw = try Self.detect(with: handler)
         guard let person = raw.first else {
             // Lost the golfer, so drop the history rather than averaging across

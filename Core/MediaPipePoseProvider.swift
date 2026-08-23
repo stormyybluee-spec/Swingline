@@ -205,6 +205,17 @@ class MediaPipePoseProvider: PoseProvider {
     private let roiEnabled: Bool
     private let roiMargin: Double
 
+    /*
+      Invisible contrast enhancement for the detector input. Nil means the layer
+      is off and the provider behaves exactly as before, which is the live
+      path's default so capture is unchanged until a caller opts in. When set,
+      the full frame path renders an enhanced copy into a fresh buffer and the
+      ROI crop path fuses the enhancement into the crop render it already does.
+      Geometry preserving, so no landmark coordinate or ROI remap changes. See
+      ImagePreprocessing.swift.
+    */
+    private let enhancer: PoseImageEnhancer?
+
     private var lastSelectedCenter: (x: Double, y: Double)?
     private var lastSelectedTimestampMs: Double?
     /// Running estimate of the detection cadence, for scaling the
@@ -271,7 +282,8 @@ class MediaPipePoseProvider: PoseProvider {
         maxCentroidJumpPerStep: Double = 0.15,
         continuityStaleMs: Double = 600,
         roiEnabled: Bool = false,
-        roiMargin: Double = 0.15
+        roiMargin: Double = 0.15,
+        enhancer: PoseImageEnhancer? = nil
     ) {
         let ns = modelFileName as NSString
         let ext = ns.pathExtension
@@ -294,6 +306,7 @@ class MediaPipePoseProvider: PoseProvider {
         self.continuityStaleMs = max(0, continuityStaleMs)
         self.roiEnabled = roiEnabled
         self.roiMargin = max(0, roiMargin)
+        self.enhancer = enhancer
         setupPoseLandmarker()
     }
 
@@ -314,7 +327,8 @@ class MediaPipePoseProvider: PoseProvider {
         maxCentroidJumpPerStep: Double = 0.15,
         continuityStaleMs: Double = 600,
         roiEnabled: Bool = false,
-        roiMargin: Double = 0.15
+        roiMargin: Double = 0.15,
+        enhancer: PoseImageEnhancer? = nil
     ) {
         self.init(
             modelFileName: Self.modelFileName(forSettingsModel: settingsModel),
@@ -329,7 +343,8 @@ class MediaPipePoseProvider: PoseProvider {
             maxCentroidJumpPerStep: maxCentroidJumpPerStep,
             continuityStaleMs: continuityStaleMs,
             roiEnabled: roiEnabled,
-            roiMargin: roiMargin
+            roiMargin: roiMargin,
+            enhancer: enhancer
         )
     }
 
@@ -556,7 +571,21 @@ class MediaPipePoseProvider: PoseProvider {
             }
         }
         if image == nil {
-            image = try? MPImage(sampleBuffer: frame, orientation: orientation)
+            // Contrast enhancement, when engaged. The enhancer renders an
+            // enhanced copy into a FRESH buffer and we hand only that to the
+            // detector; the incoming sample buffer, which the preview layer and
+            // overlay read, is never touched. Same orientation is passed as the
+            // raw path, and the enhancement is geometry preserving, so landmark
+            // coordinates and the ROI remap are identical with it on or off. Any
+            // failure falls through to the untouched buffer, so a frame is never
+            // lost to the filter.
+            if let enhancer,
+               let enhanced = enhancer.enhancedBuffer(from: frame),
+               let mp = try? MPImage(pixelBuffer: enhanced, orientation: orientation) {
+                image = mp
+            } else {
+                image = try? MPImage(sampleBuffer: frame, orientation: orientation)
+            }
         }
         guard let image else { return [] }
 
@@ -1100,7 +1129,15 @@ class MediaPipePoseProvider: PoseProvider {
         guard let out = created else { return nil }
 
         let ciRect = CGRect(x: px, y: bh - (py + ph), width: pw, height: ph)
-        let source = CIImage(cvPixelBuffer: pixelBuffer).cropped(to: ciRect)
+        var source = CIImage(cvPixelBuffer: pixelBuffer).cropped(to: ciRect)
+        // Fuse the enhancement into the crop render that already happens here,
+        // so it costs a sampler read rather than a pass. The crop IS the
+        // golfer's box, so ROI luma normalization is meaningful and allowed on
+        // this path (it is off in the default config regardless). Geometry
+        // preserving, so the exactBuffer rect below and the remap are unchanged.
+        if let enhancer {
+            source = enhancer.enhanced(source, roiNormalize: true)
+        }
         roiContext.render(source, to: out, bounds: ciRect, colorSpace: CGColorSpaceCreateDeviceRGB())
 
         guard let image = try? MPImage(pixelBuffer: out, orientation: orientation) else { return nil }

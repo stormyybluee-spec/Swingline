@@ -115,6 +115,12 @@ final class CropRefinementPass {
     private let landmarker: PoseLandmarker
     private let config: CropRefinementConfig
     private let ciContext = CIContext(options: [.cacheIntermediates: false])
+    /// Optional contrast enhancement, fused into the crop render below. This is
+    /// the highest value surface for it: the pass exists for the downswing,
+    /// where the arms blur hardest and a dark shirt against a dark background
+    /// loses its silhouette exactly when the wrists move fastest. Nil leaves the
+    /// pass byte for byte as before.
+    private let enhancer: PoseImageEnhancer?
 
     // MARK: - Device gate
 
@@ -170,7 +176,8 @@ final class CropRefinementPass {
         track: AVAssetTrack?,
         cgOrientation: CGImagePropertyOrientation,
         settingsModel: String,
-        config: CropRefinementConfig = CropRefinementConfig()
+        config: CropRefinementConfig = CropRefinementConfig(),
+        enhancer: PoseImageEnhancer? = nil
     ) {
         guard let track else { return nil }
         guard let landmarker = MediaPipePoseProvider.makeImageLandmarker(settingsModel: settingsModel) else {
@@ -181,6 +188,7 @@ final class CropRefinementPass {
         self.cgOrientation = cgOrientation
         self.landmarker = landmarker
         self.config = config
+        self.enhancer = enhancer
     }
 
     /// Convenience that loads the video track itself.
@@ -188,12 +196,13 @@ final class CropRefinementPass {
         asset: AVURLAsset,
         cgOrientation: CGImagePropertyOrientation,
         settingsModel: String,
-        config: CropRefinementConfig = CropRefinementConfig()
+        config: CropRefinementConfig = CropRefinementConfig(),
+        enhancer: PoseImageEnhancer? = nil
     ) async {
         let track = try? await asset.loadTracks(withMediaType: .video).first
         self.init(
             asset: asset, track: track, cgOrientation: cgOrientation,
-            settingsModel: settingsModel, config: config
+            settingsModel: settingsModel, config: config, enhancer: enhancer
         )
     }
 
@@ -317,7 +326,13 @@ final class CropRefinementPass {
         let outW = Int(cropped.extent.width.rounded())
         let outH = Int(cropped.extent.height.rounded())
         guard outW > 8, outH > 8, let outBuffer = makePixelBuffer(width: outW, height: outH) else { return 0 }
-        ciContext.render(cropped, to: outBuffer)
+        // Fuse the enhancement into this render (it evaluates the whole chain in
+        // one pass). Applied after the upscale, so the local neighbourhood is
+        // measured in output pixels, which gives the sharpened wrists a tighter,
+        // more selective local contrast than the full frame gets. Geometry
+        // preserving, so the box remap in step 361 onward is unchanged.
+        let toRender = enhancer?.enhanced(cropped, roiNormalize: false) ?? cropped
+        ciContext.render(toRender, to: outBuffer)
 
         // 3. Detect, image mode, on the crop.
         guard let mpImage = try? MPImage(pixelBuffer: outBuffer),

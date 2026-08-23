@@ -154,6 +154,16 @@ enum UploadProcessor {
     /// diff the results.
     static var roiMaskEnabled = false
 
+    /// Invisible contrast enhancement of the DETECTOR INPUT only (dark clothing
+    /// on dark backgrounds, backlit clips, same luminance confusion). On by
+    /// default: it strictly widens the luminance band the detector reads and is
+    /// geometry preserving, so it cannot move a landmark, only help one be
+    /// found. The switch exists so QA can diff a clip with it off. Shared by the
+    /// MediaPipe provider, the crop refinement pass, and the Vision fallback, so
+    /// every surface that reaches a detector is covered by one instance. See
+    /// ImagePreprocessing.swift.
+    static var contrastEnhancementEnabled = true
+
     struct Result {
         var record: SwingRecord
         /// The refined frames: the playback, overlay and export currency.
@@ -167,6 +177,17 @@ enum UploadProcessor {
         /// the velocity and phase start and stop already decided. The
         /// overlay draws the active samples and computes nothing.
         var handPath: [HandPathSample]
+        /*
+          Round five (P0). The address window this clip was measured
+          against, in clip milliseconds, or nil when no usable window was
+          found. Travels out so the 3D view can build its SwingAnchor from
+          the same known-good frames the corrector used, instead of from
+          clip extremes that one residual bad frame can set. Not persisted
+          on SwingRecord: it is a property of this processing run, and
+          adding it to the stored record would need a schema migration for
+          no benefit the view cannot get from here.
+        */
+        var addressReference: AddressReference?
         // The stable clip to keep with the swing, so analysis can play it back.
         var video: URL
         /*
@@ -204,6 +225,14 @@ enum UploadProcessor {
             url: videoURL, maxFps: targetFps, maxSeconds: maxSeconds
         )
 
+        // One enhancer for the whole clip, shared by the provider, the crop
+        // pass, and the Vision fallback below. Nil when disabled, which every
+        // consumer reads as "behave exactly as before". Upload preset: full
+        // strength, since this path is offline.
+        let enhancer: PoseImageEnhancer? = contrastEnhancementEnabled
+            ? PoseImageEnhancer(config: .upload)
+            : nil
+
         // ---- 2. Backend: MediaPipe VIDEO mode, Vision as fallback ---------
 
         let useMediaPipe = MediaPipePoseProvider.isModelAvailable(settingsModel: model)
@@ -232,7 +261,8 @@ enum UploadProcessor {
                 baselineFrameCount: 5,
                 maxCentroidJumpPerStep: 0.15,
                 roiEnabled: roiMaskEnabled,
-                roiMargin: 0.15
+                roiMargin: 0.15,
+                enhancer: enhancer
               )
             : nil
         if !useMediaPipe {
@@ -257,7 +287,7 @@ enum UploadProcessor {
             if let provider {
                 detections = (try? await provider.detect(frame: sourced.buffer, timestampMs: ts)) ?? []
             } else {
-                detections = visionDetections(from: sourced.buffer, orientation: source.cgOrientation)
+                detections = visionDetections(from: sourced.buffer, orientation: source.cgOrientation, enhancer: enhancer)
             }
 
             if let person = detections.first {
@@ -317,6 +347,23 @@ enum UploadProcessor {
         let provisional = pass1.frames()
         let provisionalSeries = Biomechanics.buildSeries(provisional, dominantHand)
         let provisionalPhases = Phases.segment(provisionalSeries, provisional)
+
+        // ROUND FIVE (P0). The address window, captured ONCE here from the
+        // provisional hand speed and phases, then handed to every consumer
+        // that needs a known-good reading of this golfer's body: the
+        // corrector's body constants and the humanoid anchor's floor and
+        // height. Nil for a clip that starts mid-takeaway, in which case
+        // every consumer falls back to its clip statistics and the
+        // pipeline behaves exactly as it did in round four.
+        let addressReference = captureAddressReference(
+            handSpeed: provisionalSeries.handSpeed,
+            times: provisionalSeries.t,
+            phases: provisionalPhases
+        )
+        if let addressReference {
+            qc.addressReferenceFrames = addressReference.frameCountAtCapture
+            qc.addressReferenceStillness = addressReference.stillness
+        }
         progress(0.72)
 
         // ---- 6. PASS 2: re-clean from raw, refine, final smooth, prior ----
@@ -338,7 +385,8 @@ enum UploadProcessor {
                asset: source.asset,
                track: source.track,
                cgOrientation: source.cgOrientation,
-               settingsModel: model
+               settingsModel: model,
+               enhancer: enhancer
            ) {
             let window = provisionalSeries.t[p4]...provisionalSeries.t[p8]
             cropPass.run(
@@ -390,7 +438,10 @@ enum UploadProcessor {
         // wrists reach the refined frames as measured, and the hand path
         // below reads the lead wrist straight from them.
         let corrector = PosePriorCorrector.analytic(dominantHand: dominantHand)
-        corrector.run(&timeline, qc: &qc)
+        // Round five: the address reference rides in here. The two-argument
+        // spelling still exists and still self-classifies with no reference,
+        // so any caller that lags this commit is unaffected.
+        corrector.run(&timeline, qc: &qc, reference: addressReference)
         corrector.enforceGroundBackstop(&timeline, qc: &qc)
         progress(0.90)
 
@@ -439,6 +490,7 @@ enum UploadProcessor {
             rawFrames: raw,
             qc: qc,
             handPath: handPath,
+            addressReference: addressReference,
             video: videoURL,
             thumbnail: thumbnail
         )
@@ -457,6 +509,97 @@ enum UploadProcessor {
         )
     }
 
+    // MARK: - Address reference capture (round five)
+
+    /*
+      The address window, from the provisional pass. See AddressReference
+      in CoreTypes for what it is and why the pipeline wants it.
+
+      The run is anchored to the TAKEAWAY and walked backward, rather than
+      taken as the longest still run in the clip. That matters: a golfer
+      who holds the finish produces a still run at the end of the clip
+      which is often longer than the address run, and it describes the
+      finish pose. Only the frames immediately before the club moves
+      describe the pose the swing starts from.
+
+      Returns nil for a clip that starts mid-takeaway, a clip with no
+      measurable hand speed, or a window too short to carry a median. In
+      every one of those cases each consumer falls back to its clip
+      statistics and the pipeline behaves exactly as it did in round four.
+    */
+    private static func captureAddressReference(
+        handSpeed: [Double],
+        times: [Double],
+        phases: PhaseResult?,
+        config: AddressReference.CaptureConfig = AddressReference.CaptureConfig()
+    ) -> AddressReference? {
+        let n = Swift.min(handSpeed.count, times.count)
+        guard n >= 12 else { return nil }
+        guard let peak = handSpeed.prefix(n).max(), peak > 1e-6 else { return nil }
+
+        let stillBar = config.maxSpeedFraction * peak
+        let moveBar = config.takeawaySpeedFraction * peak
+
+        // Where the search ends: P1 when phases found one, otherwise the
+        // frame before the club first moves, otherwise the clip end.
+        var end = n - 1
+        if let p1 = phases?.idx[.p1], p1 > 0, p1 < n {
+            end = p1
+        } else if let firstMove = (0..<n).first(where: { handSpeed[$0] > moveBar }), firstMove > 0 {
+            end = firstMove - 1
+        }
+        guard end > 0 else { return nil }
+
+        // The still run ending at (or just before) the takeaway. A single
+        // frame of noise inside an otherwise still stretch would truncate
+        // the run, so one frame over the bar is tolerated as long as its
+        // neighbours are under it: at 60 Hz a lone spike is a tracking
+        // artefact, not the golfer starting the swing.
+        func still(_ i: Int) -> Bool { handSpeed[i] < stillBar }
+        var last = end
+        while last > 0, !still(last) { last -= 1 }
+        guard still(last) else { return nil }
+
+        var first = last
+        while first > 0 {
+            let candidate = first - 1
+            if still(candidate) {
+                first = candidate
+            } else if candidate > 0, still(candidate - 1) {
+                // One-frame excursion inside the run: step over it.
+                first = candidate - 1
+            } else {
+                break
+            }
+        }
+
+        // Trim to the last maxDurationMs, so a long settle keeps only the
+        // frames that describe the address the swing starts from.
+        var startMs = times[first]
+        let endMs = times[last]
+        if endMs - startMs > config.maxDurationMs {
+            startMs = endMs - config.maxDurationMs
+        }
+        guard endMs - startMs >= config.minDurationMs else { return nil }
+
+        var inside: [Double] = []
+        var count = 0
+        for i in first...last where times[i] >= startMs {
+            inside.append(handSpeed[i])
+            count += 1
+        }
+        guard count >= 8 else { return nil }
+        inside.sort()
+        let stillness = inside[inside.count / 2] / peak
+
+        return AddressReference(
+            startMs: startMs,
+            endMs: endMs,
+            stillness: (stillness * 1000).rounded() / 1000,
+            frameCountAtCapture: count
+        )
+    }
+
     // MARK: - Vision fallback
 
     /// Shared CoreImage context for the fallback conversion. Cheap to hold,
@@ -472,10 +615,15 @@ enum UploadProcessor {
     */
     private static func visionDetections(
         from buffer: CMSampleBuffer,
-        orientation: CGImagePropertyOrientation
+        orientation: CGImagePropertyOrientation,
+        enhancer: PoseImageEnhancer?
     ) -> [PersonDetection] {
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(buffer) else { return [] }
-        let ci = CIImage(cvPixelBuffer: pixelBuffer).oriented(orientation)
+        var ci = CIImage(cvPixelBuffer: pixelBuffer).oriented(orientation)
+        // Fuse the enhancement into the createCGImage render this path already
+        // does, so it costs nothing extra. Geometry preserving, so the
+        // normalised image points Vision returns are unchanged in meaning.
+        if let enhancer { ci = enhancer.enhanced(ci, roiNormalize: false) }
         guard let cg = ciContext.createCGImage(ci, from: ci.extent) else { return [] }
         return (try? VisionPoseProvider.detect(cgImage: cg)) ?? []
     }

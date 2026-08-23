@@ -304,6 +304,120 @@ public struct SwingAnchor: Equatable {
     public static let fallback = SwingAnchor(ySign: 1, floorY: -0.9, bodyHeight: 1.7, shoulderSpan: 0.38)
 
     public static func measure(frames: [Frame]) -> SwingAnchor {
+        measure(frames: frames, reference: nil)
+    }
+
+    /*
+      ROUND FIVE (P0). The same measurement, with the address window as the
+      preferred source for the two numbers that were extremes.
+
+      WHY THE EXTREMES WERE WRONG. floorY was the minimum sole y anywhere
+      in the clip and bodyHeight was built from the maximum nose y
+      anywhere. A minimum is the most outlier-sensitive statistic there
+      is: one residual below-turf frame that the backstop missed by two
+      millimetres set the render floor for the whole swing, and the figure
+      then hovered above its own grid on every honest frame. No pipeline
+      correction can fix a floor measured from the wrong statistic.
+
+      WHY THE ADDRESS WINDOW IS THE RIGHT SOURCE. At address both feet are
+      flat on the turf by definition, so the MEDIAN sole height over those
+      frames IS the ground, with no outlier sensitivity at all, and the
+      golfer stands at full height so the nose median is the true head
+      level rather than the top of a follow-through extension.
+
+      THE SAFETY CLAMP. A golfer who addresses on a mat and swings off it,
+      or a clip whose address frames were themselves badly tracked, could
+      produce a reference floor ABOVE where the feet actually go later,
+      and the figure would then pierce the grid for the rest of the clip.
+      So the reference floor is clamped toward the ground to sit no higher
+      than the clip's tenth percentile sole height. A percentile, not the
+      minimum: the point is to bound against the robust body of the clip,
+      not to hand the decision back to the single worst frame.
+
+      Falls back to the extremes path, unchanged, whenever the window is
+      absent, lands on no frames, or carries fewer than minReferenceFrames
+      usable soles.
+    */
+    public static func measure(frames: [Frame], reference: AddressReference?) -> SwingAnchor {
+        let base = measureFromExtremes(frames: frames)
+        guard let reference, !frames.isEmpty else { return base }
+
+        let times = frames.map { $0.t }
+        let indices = reference.frameIndices(in: times)
+        guard indices.count >= minReferenceFrames else { return base }
+
+        let ySign = base.ySign
+        let soleJoints = [
+            Landmarks.LEFT_HEEL, Landmarks.RIGHT_HEEL,
+            Landmarks.LEFT_FOOT_INDEX, Landmarks.RIGHT_FOOT_INDEX,
+        ]
+
+        var refSoles: [Float] = []
+        var refTops: [Float] = []
+        var refSpans: [Float] = []
+        for i in indices where i >= 0 && i < frames.count {
+            let w = frames[i].world
+            for j in soleJoints where Self.trusted(w, j) {
+                refSoles.append(Float(w[j].y) * ySign)
+            }
+            if Self.trusted(w, Landmarks.NOSE) {
+                refTops.append(Float(w[Landmarks.NOSE].y) * ySign)
+            }
+            if Self.trusted(w, Landmarks.LEFT_SHOULDER), Self.trusted(w, Landmarks.RIGHT_SHOULDER) {
+                let a = w[Landmarks.LEFT_SHOULDER], b = w[Landmarks.RIGHT_SHOULDER]
+                let dx = a.x - b.x, dy = a.y - b.y, dz = (a.z ?? 0) - (b.z ?? 0)
+                refSpans.append(Float((dx * dx + dy * dy + dz * dz).squareRoot()))
+            }
+        }
+        guard refSoles.count >= minReferenceFrames, refTops.count >= minReferenceFrames else { return base }
+
+        func median(_ values: [Float]) -> Float {
+            let sorted = values.sorted()
+            return sorted[sorted.count / 2]
+        }
+
+        // The clip's tenth percentile sole, the clamp's lower bound. Not
+        // the minimum: see the note above.
+        var clipSoles: [Float] = []
+        for frame in frames {
+            let w = frame.world
+            for j in soleJoints where Self.trusted(w, j) {
+                clipSoles.append(Float(w[j].y) * ySign)
+            }
+        }
+        var floorY = median(refSoles)
+        if clipSoles.count >= 20 {
+            clipSoles.sort()
+            let p10 = clipSoles[Int(Double(clipSoles.count - 1) * 0.10)]
+            floorY = Swift.min(floorY, p10)
+        }
+
+        let topY = median(refTops)
+        guard floorY.isFinite, topY.isFinite, topY > floorY else { return base }
+
+        // The same 1.06 skull allowance the extremes path applies, so the
+        // two paths cannot disagree about what body height means.
+        let measured = (topY - floorY) * 1.06
+        let span = refSpans.isEmpty ? base.shoulderSpan : median(refSpans)
+
+        return SwingAnchor(
+            ySign: ySign,
+            floorY: floorY,
+            bodyHeight: Swift.max(0.9, measured),
+            shoulderSpan: Swift.max(0.18, span)
+        )
+    }
+
+    /// Minimum usable address frames before the reference is believed over
+    /// the clip extremes. Twelve matches the corrector's own reference
+    /// gate, so the two consumers agree about what a usable window is.
+    private static let minReferenceFrames = 12
+
+    /// The clip-extremes measurement, unchanged from round four. Kept as
+    /// the fallback for every path with no address window: a clip that
+    /// starts mid-takeaway, the Vision backend with no sole slots, or any
+    /// caller still using the one-argument spelling.
+    private static func measureFromExtremes(frames: [Frame]) -> SwingAnchor {
         guard !frames.isEmpty else { return .fallback }
 
         let ankles = [Landmarks.LEFT_ANKLE, Landmarks.RIGHT_ANKLE]

@@ -298,6 +298,46 @@ public struct CleanupConfig {
     }
     public var backgroundLock = BackgroundLockConfig()
 
+    /*
+      Centre-of-mass tracking (round five, P0). Every other check in this
+      engine is per-joint or per-bone, so a WHOLE-BODY failure passes them
+      all: the selection lock swapping to a background walker, the audited
+      "elbows, wrists and palms clumped onto the torso", both shoulders
+      collapsing to the trapezius. Each of those moves several joints a
+      plausible individual distance while moving the body's mass
+      distribution impossibly far.
+
+      A Dempster mass-weighted centre of mass is one point per frame that
+      averages about ten landmarks, so it is roughly three times quieter
+      than any single joint, and the physical quantity it estimates cannot
+      jump: a golfer shifts weight over hundreds of milliseconds.
+
+      The check convicts at the BODY level and attributes at the JOINT
+      level. It never blanket-rejects a frame, which would starve the
+      timeline and break this engine's ONE RULE by proxy; it flags only
+      the joints whose own displacement carried the jump, and when the
+      jump is distributed with no subset to blame it rejects nothing and
+      records the sighting in qc.comJumpsDetected.
+    */
+    public struct CoMTrackingConfig {
+        public var enabled: Bool = true
+        /// Conviction: CoM step over this factor of its own clip median.
+        /// 4.0 where single joints use 3.0, because the CoM is quieter.
+        public var stepFactor: Double = 4.0
+        /// Absolute floors per space, so a still address cannot
+        /// self-reject on sensor noise.
+        public var minStepNorm: Double = 0.02
+        public var minStepWorld: Double = 0.05
+        /// Attribution: a core joint whose own step exceeds this factor of
+        /// its own clip-median step is blamed for a convicted frame.
+        /// Looser than the conviction bar on purpose; see the spec note.
+        public var jointFactor: Double = 2.5
+        /// Per-clip valve, matching every other rejection stage.
+        public var maxFraction: Double = 0.15
+        public init() {}
+    }
+    public var com = CoMTrackingConfig()
+
     public init() {}
 
     /*
@@ -435,6 +475,31 @@ public final class LandmarkCleanupEngine {
                     minStep: config.minStepWorld, missing: &missing[j]
                 )
             }
+        }
+
+        // ---- 2b. Centre-of-mass tracking (round five, P0) ----------------
+        //
+        // See the CleanupConfig note for the failure class and why the
+        // check convicts at the body level and attributes at the joint
+        // level. Runs BEFORE the bone stage on purpose: a whole-body
+        // displacement that reaches the bone checks is explained there as
+        // eight separate broken bones, and eight distal joints are blamed
+        // for one failure. Runs AFTER the velocity spikes so a single
+        // teleporting joint has already been removed and cannot dominate
+        // the body-level signal on its own.
+        //
+        // NOTE FOR TrackingQC: add comFramesEvaluated, comJumpsDetected
+        // and comRejections alongside outliersRejected.
+        if config.com.enabled {
+            let com = flagCentreOfMassJumps(
+                timeline: timeline,
+                aliveNorm: aliveNorm, aliveWorld: aliveWorld,
+                missing: &missing
+            )
+            outliers += com.flagged
+            qc.comFramesEvaluated += com.evaluated
+            qc.comJumpsDetected += com.jumps
+            qc.comRejections += com.flagged
         }
 
         // ---- 3. Bone-length breaks (M-rules, world space only) -----------
@@ -695,6 +760,154 @@ public final class LandmarkCleanupEngine {
             }
         }
         return flagged
+    }
+
+    // MARK: - Centre-of-mass tracking (round five, P0)
+
+    /// The core segments, as (a, b, fraction) with a == b meaning a point
+    /// mass at that landmark. Arms are excluded; see Geometry.Dempster's
+    /// note for why.
+    private static let comSegments: [(a: Int, b: Int, fraction: Double)] = [
+        (Landmarks.NOSE, Landmarks.NOSE, Geometry.Dempster.head),
+        (Landmarks.LEFT_SHOULDER, Landmarks.RIGHT_SHOULDER, Geometry.Dempster.upperTrunk),
+        (Landmarks.LEFT_HIP, Landmarks.RIGHT_HIP, Geometry.Dempster.lowerTrunk),
+        (Landmarks.LEFT_HIP, Landmarks.LEFT_KNEE, Geometry.Dempster.thigh),
+        (Landmarks.RIGHT_HIP, Landmarks.RIGHT_KNEE, Geometry.Dempster.thigh),
+        (Landmarks.LEFT_KNEE, Landmarks.LEFT_ANKLE, Geometry.Dempster.shank),
+        (Landmarks.RIGHT_KNEE, Landmarks.RIGHT_ANKLE, Geometry.Dempster.shank),
+    ]
+
+    /*
+      One pass, one space (world when it is alive, image space otherwise,
+      because the world set is metric and hip-relative while the image set
+      is the one the Vision backend actually fills).
+
+      A frame contributes a CoM only when EVERY core segment is available,
+      both endpoints finite and neither already flagged. Partial frames are
+      skipped rather than renormalised: renormalising over the surviving
+      segments moves the CoM toward whichever ones survived and would
+      manufacture exactly the jump this check looks for.
+
+      Conviction uses the same out-and-back signature as the velocity
+      spike stage: a real weight shift keeps travelling, a tracking failure
+      comes back. Attribution then names the joints whose own displacement
+      carried the jump, so the engine's ONE RULE is honoured at the level
+      it is stated: samples are rejected, and only samples that are
+      themselves implicated.
+
+      Returns what was evaluated, what was convicted, and what was flagged,
+      because those are three different numbers and a clip where the check
+      saw a jump but could not attribute it should say exactly that.
+    */
+    private func flagCentreOfMassJumps(
+        timeline: PoseTimeline,
+        aliveNorm: [Bool], aliveWorld: [Bool],
+        missing: inout [[Bool]]
+    ) -> (evaluated: Int, jumps: Int, flagged: Int) {
+        let n = timeline.frameCount
+        let joints = timeline.jointCount
+        guard n > 8 else { return (0, 0, 0) }
+
+        let segments = Self.comSegments.filter { max($0.a, $0.b) < joints }
+        guard segments.count == Self.comSegments.count else { return (0, 0, 0) }
+
+        // World when every core joint carries it, image space otherwise.
+        let coreJoints = Set(segments.flatMap { [$0.a, $0.b] })
+        let useWorld = coreJoints.allSatisfy { aliveWorld[$0] }
+        guard useWorld || coreJoints.allSatisfy({ aliveNorm[$0] }) else { return (0, 0, 0) }
+        let bank = useWorld ? timeline.world : timeline.norm
+        let minStep = useWorld ? config.com.minStepWorld : config.com.minStepNorm
+
+        func usable(_ j: Int, _ i: Int) -> Bool {
+            !missing[j][i] && bank.x[j][i].isFinite && bank.y[j][i].isFinite
+        }
+
+        // ---- 1. The centre of mass per frame -----------------------------
+
+        var comX = [Double](repeating: .nan, count: n)
+        var comY = [Double](repeating: .nan, count: n)
+        var evaluated = 0
+        let total = Geometry.Dempster.coreFractionSum
+        guard total > 1e-9 else { return (0, 0, 0) }
+
+        for i in 0..<n {
+            var sx = 0.0, sy = 0.0
+            var complete = true
+            for seg in segments {
+                guard usable(seg.a, i), usable(seg.b, i) else { complete = false; break }
+                let px = (bank.x[seg.a][i] + bank.x[seg.b][i]) / 2
+                let py = (bank.y[seg.a][i] + bank.y[seg.b][i]) / 2
+                sx += seg.fraction * px
+                sy += seg.fraction * py
+            }
+            guard complete else { continue }
+            comX[i] = sx / total
+            comY[i] = sy / total
+            evaluated += 1
+        }
+        guard evaluated > 8 else { return (evaluated, 0, 0) }
+
+        // ---- 2. The step series and its threshold ------------------------
+
+        func comStep(_ i: Int, _ k: Int) -> Double? {
+            guard comX[i].isFinite, comX[k].isFinite else { return nil }
+            let dx = comX[i] - comX[k], dy = comY[i] - comY[k]
+            return (dx * dx + dy * dy).squareRoot()
+        }
+
+        var steps: [Double] = []
+        for i in 1..<n { if let d = comStep(i, i - 1) { steps.append(d) } }
+        guard steps.count > 8 else { return (evaluated, 0, 0) }
+        steps.sort()
+        let median = steps[steps.count / 2]
+        let threshold = Swift.max(config.com.stepFactor * median, minStep)
+
+        // ---- 3. Per-joint step medians, for attribution ------------------
+
+        var jointMedian: [Int: Double] = [:]
+        for j in coreJoints {
+            var js: [Double] = []
+            for i in 1..<n where usable(j, i) && usable(j, i - 1) {
+                let dx = bank.x[j][i] - bank.x[j][i - 1]
+                let dy = bank.y[j][i] - bank.y[j][i - 1]
+                js.append((dx * dx + dy * dy).squareRoot())
+            }
+            guard js.count > 8 else { continue }
+            js.sort()
+            jointMedian[j] = js[js.count / 2]
+        }
+
+        // ---- 4. Convict, then attribute ----------------------------------
+
+        var jumps = 0
+        var flagged = 0
+        let cap = Int(Double(evaluated) * config.com.maxFraction)
+
+        for i in 1..<(n - 1) {
+            guard flagged < cap else { break }
+            guard let sIn = comStep(i, i - 1), let sOut = comStep(i + 1, i),
+                  sIn > threshold, sOut > threshold,
+                  let across = comStep(i + 1, i - 1),
+                  across < 0.5 * Swift.max(sIn, sOut) else { continue }
+            jumps += 1
+
+            // Attribution: the joints whose own displacement carried it.
+            // A frame with no dominant joint is a distributed failure (a
+            // selection lock swap moves everything at once), and there is
+            // no honest subset to reject, so it is counted and left.
+            for j in coreJoints {
+                guard let m = jointMedian[j], m > 1e-9, !missing[j][i],
+                      usable(j, i), usable(j, i - 1) else { continue }
+                let dx = bank.x[j][i] - bank.x[j][i - 1]
+                let dy = bank.y[j][i] - bank.y[j][i - 1]
+                let d = (dx * dx + dy * dy).squareRoot()
+                guard d > config.com.jointFactor * m else { continue }
+                missing[j][i] = true
+                flagged += 1
+            }
+        }
+
+        return (evaluated, jumps, flagged)
     }
 
     // MARK: - Bone breaks
