@@ -65,31 +65,6 @@
 //  Pelvis sway is therefore invisible here by construction, in this build and in
 //  the web build equally. The metrics bar is where sway is read, not this panel.
 //
-//  SKELETON OVERHAUL (this pass). Four changes, each detailed at its site:
-//
-//    THE FLOOR IS MEASURED AT THE SOLE. SwingAnchor used to take the lowest
-//    ANKLE over the clip as floorY, but the ankle joint sits several
-//    centimetres above the sole, so the grid was drawn at ankle height and
-//    the heel, toe and shoe geometry pierced it on every planted frame by
-//    construction. The floor now comes from the heels and foot indices, with
-//    an anthropometric ankle drop for the ankle-only Vision fallback.
-//
-//    THE ANKLE CARRIES A RENDER-SIDE BACKSTOP, at turf plus the shoe's half
-//    thickness. The pipeline's ground stage owns anatomical correctness;
-//    this floor only guarantees no residual smoothing undershoot can draw
-//    the joint through the grid. It is deliberately NOT a clamp onto floorY
-//    itself, which would flatten every planted foot.
-//
-//    FOOT PLANTING RESPECTS THE GROUND PLANE in both directions. The old
-//    toe rule dragged the toe down onto the turf unconditionally and never
-//    stopped it going below. The toe now rests on the turf, follows a
-//    genuine lift, and can never sit under the ground.
-//
-//    THE TORSO IS PLACED ON THE SPINE CHAIN. The three torso masses twist
-//    individually along the pelvis, lumbar, thoracic, cervical chain from
-//    SpineChain.swift, so the X factor is visible on the body itself. The
-//    original straight stack remains as the per-frame fallback.
-//
 //  House rule: no em dashes anywhere.
 //
 
@@ -304,120 +279,6 @@ public struct SwingAnchor: Equatable {
     public static let fallback = SwingAnchor(ySign: 1, floorY: -0.9, bodyHeight: 1.7, shoulderSpan: 0.38)
 
     public static func measure(frames: [Frame]) -> SwingAnchor {
-        measure(frames: frames, reference: nil)
-    }
-
-    /*
-      ROUND FIVE (P0). The same measurement, with the address window as the
-      preferred source for the two numbers that were extremes.
-
-      WHY THE EXTREMES WERE WRONG. floorY was the minimum sole y anywhere
-      in the clip and bodyHeight was built from the maximum nose y
-      anywhere. A minimum is the most outlier-sensitive statistic there
-      is: one residual below-turf frame that the backstop missed by two
-      millimetres set the render floor for the whole swing, and the figure
-      then hovered above its own grid on every honest frame. No pipeline
-      correction can fix a floor measured from the wrong statistic.
-
-      WHY THE ADDRESS WINDOW IS THE RIGHT SOURCE. At address both feet are
-      flat on the turf by definition, so the MEDIAN sole height over those
-      frames IS the ground, with no outlier sensitivity at all, and the
-      golfer stands at full height so the nose median is the true head
-      level rather than the top of a follow-through extension.
-
-      THE SAFETY CLAMP. A golfer who addresses on a mat and swings off it,
-      or a clip whose address frames were themselves badly tracked, could
-      produce a reference floor ABOVE where the feet actually go later,
-      and the figure would then pierce the grid for the rest of the clip.
-      So the reference floor is clamped toward the ground to sit no higher
-      than the clip's tenth percentile sole height. A percentile, not the
-      minimum: the point is to bound against the robust body of the clip,
-      not to hand the decision back to the single worst frame.
-
-      Falls back to the extremes path, unchanged, whenever the window is
-      absent, lands on no frames, or carries fewer than minReferenceFrames
-      usable soles.
-    */
-    public static func measure(frames: [Frame], reference: AddressReference?) -> SwingAnchor {
-        let base = measureFromExtremes(frames: frames)
-        guard let reference, !frames.isEmpty else { return base }
-
-        let times = frames.map { $0.t }
-        let indices = reference.frameIndices(in: times)
-        guard indices.count >= minReferenceFrames else { return base }
-
-        let ySign = base.ySign
-        let soleJoints = [
-            Landmarks.LEFT_HEEL, Landmarks.RIGHT_HEEL,
-            Landmarks.LEFT_FOOT_INDEX, Landmarks.RIGHT_FOOT_INDEX,
-        ]
-
-        var refSoles: [Float] = []
-        var refTops: [Float] = []
-        var refSpans: [Float] = []
-        for i in indices where i >= 0 && i < frames.count {
-            let w = frames[i].world
-            for j in soleJoints where Self.trusted(w, j) {
-                refSoles.append(Float(w[j].y) * ySign)
-            }
-            if Self.trusted(w, Landmarks.NOSE) {
-                refTops.append(Float(w[Landmarks.NOSE].y) * ySign)
-            }
-            if Self.trusted(w, Landmarks.LEFT_SHOULDER), Self.trusted(w, Landmarks.RIGHT_SHOULDER) {
-                let a = w[Landmarks.LEFT_SHOULDER], b = w[Landmarks.RIGHT_SHOULDER]
-                let dx = a.x - b.x, dy = a.y - b.y, dz = (a.z ?? 0) - (b.z ?? 0)
-                refSpans.append(Float((dx * dx + dy * dy + dz * dz).squareRoot()))
-            }
-        }
-        guard refSoles.count >= minReferenceFrames, refTops.count >= minReferenceFrames else { return base }
-
-        func median(_ values: [Float]) -> Float {
-            let sorted = values.sorted()
-            return sorted[sorted.count / 2]
-        }
-
-        // The clip's tenth percentile sole, the clamp's lower bound. Not
-        // the minimum: see the note above.
-        var clipSoles: [Float] = []
-        for frame in frames {
-            let w = frame.world
-            for j in soleJoints where Self.trusted(w, j) {
-                clipSoles.append(Float(w[j].y) * ySign)
-            }
-        }
-        var floorY = median(refSoles)
-        if clipSoles.count >= 20 {
-            clipSoles.sort()
-            let p10 = clipSoles[Int(Double(clipSoles.count - 1) * 0.10)]
-            floorY = Swift.min(floorY, p10)
-        }
-
-        let topY = median(refTops)
-        guard floorY.isFinite, topY.isFinite, topY > floorY else { return base }
-
-        // The same 1.06 skull allowance the extremes path applies, so the
-        // two paths cannot disagree about what body height means.
-        let measured = (topY - floorY) * 1.06
-        let span = refSpans.isEmpty ? base.shoulderSpan : median(refSpans)
-
-        return SwingAnchor(
-            ySign: ySign,
-            floorY: floorY,
-            bodyHeight: Swift.max(0.9, measured),
-            shoulderSpan: Swift.max(0.18, span)
-        )
-    }
-
-    /// Minimum usable address frames before the reference is believed over
-    /// the clip extremes. Twelve matches the corrector's own reference
-    /// gate, so the two consumers agree about what a usable window is.
-    private static let minReferenceFrames = 12
-
-    /// The clip-extremes measurement, unchanged from round four. Kept as
-    /// the fallback for every path with no address window: a clip that
-    /// starts mid-takeaway, the Vision backend with no sole slots, or any
-    /// caller still using the one-argument spelling.
-    private static func measureFromExtremes(frames: [Frame]) -> SwingAnchor {
         guard !frames.isEmpty else { return .fallback }
 
         let ankles = [Landmarks.LEFT_ANKLE, Landmarks.RIGHT_ANKLE]
@@ -460,50 +321,17 @@ public struct SwingAnchor: Equatable {
            Vision frames without a backend flag. */
         let ySign: Float = ankleMean > headMean ? -1 : 1
 
-        /* Ground is the lowest SOLE point anywhere in the clip, in SceneKit
-           space.
-
-           THE BUG THIS REPLACES (skeleton overhaul): the floor used to be the
-           lowest ANKLE. The ankle joint sits several centimetres above the
-           sole, so the grid was drawn at ankle height and the heel, toe and
-           shoe geometry pierced it on every planted frame by construction,
-           which is the on-screen "ankle sinks below the floor" of the audit.
-           No pipeline correction could fix a floor measured at the wrong
-           joint.
-
-           On the MediaPipe path the heels and foot indices are real, refined
-           measurements (the pose prior's ground stage clamps their
-           penetrations), so their minimum IS the turf. On the Vision path
-           those slots are visibility zero placeholders, trusted() excludes
-           them, and the fallback drops the ankle minimum by the standard
-           anthropometric ankle height, about four percent of standing height,
-           so the floor still lands at the sole rather than at the joint. */
-        let soleJoints = [
-            Landmarks.LEFT_HEEL, Landmarks.RIGHT_HEEL,
-            Landmarks.LEFT_FOOT_INDEX, Landmarks.RIGHT_FOOT_INDEX,
-        ]
-        var soleMinY = Float.greatestFiniteMagnitude
-        var ankleMinY = Float.greatestFiniteMagnitude
+        /* Ground is the lowest foot anywhere in the clip, in SceneKit space. */
+        var floorY = Float.greatestFiniteMagnitude
         var topY = -Float.greatestFiniteMagnitude
         for frame in frames {
             let w = frame.world
-            for j in soleJoints where Self.trusted(w, j) {
-                soleMinY = min(soleMinY, Float(w[j].y) * ySign)
-            }
             for j in ankles where Self.trusted(w, j) {
-                ankleMinY = min(ankleMinY, Float(w[j].y) * ySign)
+                floorY = min(floorY, Float(w[j].y) * ySign)
             }
             if Self.trusted(w, Landmarks.NOSE) {
                 topY = max(topY, Float(w[Landmarks.NOSE].y) * ySign)
             }
-        }
-        let floorY: Float
-        if soleMinY.isFinite {
-            floorY = soleMinY
-        } else if ankleMinY.isFinite, topY.isFinite, topY > ankleMinY {
-            floorY = ankleMinY - 0.045 * (topY - ankleMinY)
-        } else {
-            return .fallback
         }
         guard floorY.isFinite, topY.isFinite, topY > floorY else { return .fallback }
 
@@ -627,24 +455,6 @@ struct ResolvedPose {
         pose.leftAnkle = read(Landmarks.LEFT_ANKLE)
         pose.rightAnkle = read(Landmarks.RIGHT_ANKLE)
 
-        /* The render-side ankle backstop (skeleton overhaul). The pipeline's
-           ground stage owns anatomical correctness (it holds the ankle at its
-           own measured resting height above the turf); this floor only
-           guarantees the last inch, that no residual undershoot from the
-           smoothing can ever draw the joint through the grid. Deliberately
-           NOT a clamp to floorY itself: the ankle sits above the sole, and
-           pinning it onto the turf would flatten every planted foot, which is
-           the exact failure the pipeline's own degenerate-guard fix removed.
-           The floor here is the turf plus the shoe's half thickness, the
-           lowest the joint can sit with a sole under it. */
-        let ankleFloorY = anchor.floorY + scale.footHeight * 0.5
-        if pose.leftAnkle.ok {
-            pose.leftAnkle.p.y = max(pose.leftAnkle.p.y, ankleFloorY)
-        }
-        if pose.rightAnkle.ok {
-            pose.rightAnkle.p.y = max(pose.rightAnkle.p.y, ankleFloorY)
-        }
-
         /* Derived, not invented. A neck is where the shoulders meet and a pelvis
            is where the hips meet, and both are measured points averaged, not
            guesses about anatomy the tracker did not see. */
@@ -697,34 +507,7 @@ struct ResolvedPose {
                at a 40cm shoulder span this gives a 23cm shoe. An earlier 0.34
                gave 12cm, which is a foot half the length of the hand. */
             var p = ankle.p + forward * (scale.footLength * 0.75)
-
-            /* Foot planting (skeleton overhaul). The old rule was
-               p.y = min(p.y, planted), which is inverted twice over: it
-               dragged the toe DOWN onto the turf unconditionally, fighting
-               any genuine lift, and it never stopped the toe going BELOW the
-               turf when the incoming data was sunk, because min keeps the
-               smaller value. The rule now:
-
-                 the toe RESTS on the turf, which is where a golfer's toe
-                 spends nearly the whole swing (a trail-heel roll keeps the
-                 toe down while the ankle rises, and this renders it as the
-                 wedge steepening, correctly);
-
-                 when the ankle has risen so far that a planted toe would
-                 stretch the shoe past 1.2 of its own length, the toe rises
-                 with it, so a full foot lift or a step-through follows the
-                 leg instead of anchoring a rubber shoe to the ground;
-
-                 and the toe can NEVER sit below the turf contact height,
-                 whatever the data says, because both branches sit at or
-                 above it. */
-            let planted = anchor.floorY + scale.footHeight * 0.5
-            let maxReach = scale.footLength * 1.2
-            if ankle.p.y - planted > maxReach {
-                p.y = ankle.p.y - maxReach
-            } else {
-                p.y = planted
-            }
+            p.y = min(p.y, anchor.floorY + scale.footHeight * 0.5)
             return PosePoint(p: p, ok: true)
         }
         pose.leftFoot = foot(ankle: pose.leftAnkle)
@@ -918,38 +701,11 @@ public final class HumanoidRig {
     private var style: JointColorStyle
 
     private var segments: [SegmentID: SCNNode] = [:]
+    /* Segments switched off per joint by the golfer. Consulted by every show
+       path, so a suppressed segment survives the per frame visibility rebuild. */
+    private var suppressed: Set<SegmentID> = []
     private var markers: [MarkerID: SCNNode] = [:]
     private var markerMaterials: [MarkerID: SCNMaterial] = [:]
-
-    /*
-      Spine chain hysteresis (round four, R8). The chain gate in apply()
-      fails for a handful of frames at exactly maximum rotation, because
-      that is where a shoulder's confidence dips under the trust floor for
-      a moment, and the straight-stack fallback IS the plank the audits
-      flag, worn precisely on the most rotated frames. The pipeline is not
-      the fix; the render gate is. So the last successfully built chain's
-      four lateral axes are cached here, in scene space exactly as they
-      were handed to place(), and for up to spineRollHoldFrames of
-      CONSECUTIVE gate failures the fallback stack keeps rolling its
-      segments from the cache while its POSITIONS honestly fall back to
-      the straight lerp line: articulation persists, geometry never lies.
-      Past the hold, or when there was never a good chain, the shared-roll
-      plank returns, because a stale twist held through a genuine cut
-      would be its own artifact; 12 frames is 200 ms at the grid rate,
-      which covers the audited dips. The cache resets whenever the rig has
-      no world at all, so scrubbing across a gap re-enters cleanly:
-      apply() stays pure per frame plus this one small cache.
-    */
-    private struct SpineRollCache {
-        var pelvis: SIMD3<Float>
-        var lumbar: SIMD3<Float>
-        var thoracic: SIMD3<Float>
-        var cervical: SIMD3<Float>
-        /// Consecutive gate failures survived so far.
-        var age: Int
-    }
-    private var spineRollCache: SpineRollCache?
-    private static let spineRollHoldFrames = 12
 
     private let bodyNode = SCNNode()
     private let markerNode = SCNNode()
@@ -1169,6 +925,67 @@ public final class HumanoidRig {
         applyMarkerColours()
     }
 
+    /*
+      Show or hide every body segment in one move, so the 3D figure honours the
+      "Show connecting lines" switch the same way the 2D overlay does. The joint
+      markers live on a separate node and are left untouched, so hiding the body
+      leaves a clean dot skeleton.
+
+      This flips the shared bodyNode, the parent of every segment, rather than the
+      segments themselves. That is deliberate: apply() toggles each segment's own
+      isHidden every frame from the confidence test, and a child is drawn only
+      when neither it nor bodyNode is hidden, so setting it on the parent survives
+      the per frame updates instead of being overwritten by the next one.
+    */
+    public func setConnectingLinesVisible(_ visible: Bool) {
+        bodyNode.isHidden = !visible
+    }
+
+    /*
+      Hide the body segments belonging to a set of joints.
+
+      The 2D overlay lets a golfer switch off the lines at one joint and keep the
+      rest; this is the same switch for the 3D figure. Each joint owns the
+      segments that hang off it (a shoulder owns its cap and its upper arm, a knee
+      its cap and its shin), so switching the left knee off drops the left shin
+      and leaves the thigh above it, which is the limb the golfer chose to keep.
+
+      Stored as a suppressed set rather than applied once, because apply() rebuilds
+      every segment's visibility from the confidence test on each frame. The show
+      paths consult this set, so a suppressed segment stays hidden across frames
+      instead of reappearing on the next one.
+    */
+    func setHiddenLineJoints(_ joints: Set<JointKey>) {
+        let ids = Set(joints.flatMap { Self.segments(ownedBy: $0) })
+        guard ids != suppressed else { return }
+        suppressed = ids
+        for id in Self.allSegmentIDs where suppressed.contains(id) {
+            segments[id]?.isHidden = true
+        }
+    }
+
+    /*
+      Which segments each joint governs.
+
+      A joint owns the cap sitting on it and the segment running distally from it,
+      so every segment has exactly one owner and no segment is left ungoverned.
+      The hand and foot blocks hang off the wrist and the ankle for the same
+      reason the 2D triangle does.
+    */
+    private static func segments(ownedBy joint: JointKey) -> [SegmentID] {
+        let left = joint.isLeft
+        switch joint {
+        case .leftShoulder, .rightShoulder: return [.shoulderCap(left), .upperArm(left)]
+        case .leftElbow, .rightElbow: return [.elbowCap(left), .forearm(left)]
+        case .leftWrist, .rightWrist: return [.hand(left)]
+        case .leftHip, .rightHip: return [.thigh(left)]
+        case .leftKnee, .rightKnee: return [.kneeCap(left), .shin(left)]
+        case .leftAnkle, .rightAnkle: return [.foot(left)]
+        }
+    }
+
+    private static let allSegmentIDs: [SegmentID] = JointKey.allCases.flatMap { segments(ownedBy: $0) }
+
     public var jointColorStyle: JointColorStyle { style }
 
     private func applyMarkerColours() {
@@ -1223,10 +1040,6 @@ public final class HumanoidRig {
         defer { SCNTransaction.commit() }
 
         guard let world, !world.isEmpty else {
-            // Round four (R8): no world means no continuity to lean on, so
-            // the spine roll cache resets and scrubbing across a gap
-            // re-enters the hysteresis cleanly.
-            spineRollCache = nil
             hideAll()
             return
         }
@@ -1235,101 +1048,13 @@ public final class HumanoidRig {
         let lateral = pose.lateral
         let s = scale
 
-        /* Torso stack: the articulated spine (skeleton overhaul).
-
-           The three torso masses used to share ONE roll reference, the
-           shoulder line, and sat on lerps of a single straight segment, so
-           the torso rotated as a plank and the X factor, this app's own
-           headline metric, was invisible on the body it belongs to.
-           SpineChain derives a pelvis, lumbar, thoracic, cervical chain from
-           the measured hip and shoulder lines and distributes the measured
-           axial twist up it, so the pelvis block rolls with the hips, the
-           chest with the shoulders, and the abdomen between: the wind-up
-           becomes visible on the figure itself. Positions stay pure
-           interpolations of measured points, per that file's own rules, and
-           the interior fractions passed here reproduce this rig's original
-           mass proportions exactly, so the silhouette does not change, only
-           its articulation.
-
-           The chain needs the same four torso joints the derived midpoints
-           need, so the trust gate is pose.neck.ok and pose.pelvis.ok; when
-           either fails, or the chain refuses to build, the original straight
-           stack takes over and hides itself through the same gates as
-           before. The figure can lose articulation, never its torso.
-
-           Round four (R8): the stack's ROLL now carries hysteresis. The
-           gate dips for a few frames at exactly maximum rotation, which
-           made the fallback plank appear on precisely the frames the X
-           factor matters most, so the fallback keeps the last good chain's
-           per-segment laterals for a short hold before reverting to the
-           shared roll. See SpineRollCache above the class members. */
-        var spineChainConfig = SpineChain.Config()
-        spineChainConfig.lumbarHeightFraction = 0.28
-        spineChainConfig.thoracicHeightFraction = 0.54
-        spineChainConfig.twistFractions = (pelvis: 0, lumbar: 0.25, thoracic: 0.55, cervical: 1)
-
-        var spineDrawn = false
-        if pose.neck.ok, pose.pelvis.ok,
-           let chain = SpineChain.build(world: world, config: spineChainConfig) {
-            /* Raw world into SceneKit space, the same mapping read() uses. A
-               direction flips its y exactly the way a point does, and the
-               reflected lateral stays a valid roll reference because every
-               torso mass is symmetric across its own width axis. */
-            func scene(_ v: Vec3) -> SIMD3<Float> {
-                SIMD3(Float(v.x), Float(v.y) * anchor.ySign, Float(v.z ?? 0))
-            }
-            let pelvisP = PosePoint(p: scene(chain.pelvis.position), ok: true)
-            let lumbarP = PosePoint(p: scene(chain.lumbar.position), ok: true)
-            let thoracicP = PosePoint(p: scene(chain.thoracic.position), ok: true)
-            let cervicalP = PosePoint(p: scene(chain.cervical.position), ok: true)
-
-            place(.chest, from: cervicalP, to: thoracicP,
-                  roll: scene(chain.cervical.lateral),
-                  cross: SIMD2(s.chestWidth, s.chestDepth), lengthGain: 1.14)
-            place(.abdomen, from: thoracicP, to: lumbarP,
-                  roll: scene(chain.thoracic.lateral),
-                  cross: SIMD2(s.abdomenWidth, s.abdomenDepth), lengthGain: 1.30)
-            place(.pelvisBlock, from: lumbarP, to: pelvisP,
-                  roll: scene(chain.pelvis.lateral),
-                  cross: SIMD2(s.pelvisWidth, s.pelvisDepth), lengthGain: 1.55)
-            /* Round four (R8): remember this chain's roll references, in
-               scene space exactly as place() just received them, so a
-               short gate dip on the next frames can keep the articulation
-               alive. Age zero: the cache is fresh. */
-            spineRollCache = SpineRollCache(
-                pelvis: scene(chain.pelvis.lateral),
-                lumbar: scene(chain.lumbar.lateral),
-                thoracic: scene(chain.thoracic.lateral),
-                cervical: scene(chain.cervical.lateral),
-                age: 0
-            )
-            spineDrawn = true
-        }
-        if !spineDrawn {
-            /* Round four (R8): the hysteresis. See the SpineRollCache note.
-               Positions below are the honest straight-stack lerps in BOTH
-               branches; only the roll differs, cached per segment for a
-               short dip, shared plank past the hold or when no good chain
-               has been seen yet. */
-            if var cache = spineRollCache, cache.age < Self.spineRollHoldFrames {
-                cache.age += 1
-                spineRollCache = cache
-                place(.chest, from: pose.neck, to: pose.chestLow, roll: cache.cervical,
-                      cross: SIMD2(s.chestWidth, s.chestDepth), lengthGain: 1.14)
-                place(.abdomen, from: pose.chestLow, to: pose.abdomen, roll: cache.thoracic,
-                      cross: SIMD2(s.abdomenWidth, s.abdomenDepth), lengthGain: 1.30)
-                place(.pelvisBlock, from: pose.abdomen, to: pose.pelvis, roll: cache.pelvis,
-                      cross: SIMD2(s.pelvisWidth, s.pelvisDepth), lengthGain: 1.55)
-            } else {
-                spineRollCache = nil
-                place(.chest, from: pose.neck, to: pose.chestLow, roll: lateral,
-                      cross: SIMD2(s.chestWidth, s.chestDepth), lengthGain: 1.14)
-                place(.abdomen, from: pose.chestLow, to: pose.abdomen, roll: lateral,
-                      cross: SIMD2(s.abdomenWidth, s.abdomenDepth), lengthGain: 1.30)
-                place(.pelvisBlock, from: pose.abdomen, to: pose.pelvis, roll: lateral,
-                      cross: SIMD2(s.pelvisWidth, s.pelvisDepth), lengthGain: 1.55)
-            }
-        }
+        // Torso stack.
+        place(.chest, from: pose.neck, to: pose.chestLow, roll: lateral,
+              cross: SIMD2(s.chestWidth, s.chestDepth), lengthGain: 1.14)
+        place(.abdomen, from: pose.chestLow, to: pose.abdomen, roll: lateral,
+              cross: SIMD2(s.abdomenWidth, s.abdomenDepth), lengthGain: 1.30)
+        place(.pelvisBlock, from: pose.abdomen, to: pose.pelvis, roll: lateral,
+              cross: SIMD2(s.pelvisWidth, s.pelvisDepth), lengthGain: 1.55)
 
         /* Neck and head hang off the shoulder midpoint toward the head point.
            If the head was not seen the neck goes with it, rather than a neck
@@ -1407,15 +1132,7 @@ public final class HumanoidRig {
                 n.isHidden = true
                 continue
             }
-            /* The ankle markers carry the same render-side floor as the ankle
-               segments in ResolvedPose, so a bead can never render below the
-               joint it marks. Every other marker sits exactly on its raw
-               landmark. */
-            var y = Float(l.y) * anchor.ySign
-            if id.landmark == Landmarks.LEFT_ANKLE || id.landmark == Landmarks.RIGHT_ANKLE {
-                y = max(y, anchor.floorY + scale.footHeight * 0.5)
-            }
-            n.simdPosition = SIMD3(Float(l.x), y, Float(l.z ?? 0))
+            n.simdPosition = SIMD3(Float(l.x), Float(l.y) * anchor.ySign, Float(l.z ?? 0))
             n.isHidden = false
         }
     }
@@ -1445,7 +1162,10 @@ public final class HumanoidRig {
             hide(id)
             return
         }
-        guard let node = segments[id] else { return }
+        guard let node = segments[id], !suppressed.contains(id) else {
+            hide(id)
+            return
+        }
         var m = result.matrix
         if lengthGain != 1 {
             /* Column 1 is the local y axis, which already carries the length, so
@@ -1457,7 +1177,7 @@ public final class HumanoidRig {
     }
 
     private func cap(_ id: SegmentID, at point: PosePoint) {
-        guard point.ok, let node = segments[id] else {
+        guard point.ok, !suppressed.contains(id), let node = segments[id] else {
             hide(id)
             return
         }
@@ -1467,7 +1187,7 @@ public final class HumanoidRig {
     }
 
     private func setTransform(_ id: SegmentID, _ matrix: simd_float4x4?) {
-        guard let matrix, let node = segments[id] else {
+        guard let matrix, !suppressed.contains(id), let node = segments[id] else {
             hide(id)
             return
         }
@@ -1766,3 +1486,4 @@ public final class SwingTraceNode {
         return m
     }
 }
+

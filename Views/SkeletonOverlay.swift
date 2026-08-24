@@ -144,6 +144,14 @@ struct SkeletonOverlay: View {
     private var effectiveBoneWidth: CGFloat { settings.map { CGFloat($0.thickness) } ?? boneWidth }
     private var effectiveJointRadius: CGFloat { settings.map { 3.5 + CGFloat($0.jointSize) * 4.5 } ?? jointRadius }
 
+    /*
+      Whether the connecting lines are drawn: the bones, the spine and the foot
+      triangles. Off leaves the joint dots and angle readouts untouched. Only the
+      analysis view carries settings, so the fullscreen viewer (settings nil)
+      always draws the lines, exactly as before.
+    */
+    private var drawConnectingLines: Bool { settings?.showConnectingLines ?? true }
+
     // A body landmark is on the left when its index is odd, right when even, for
     // indices 11 and up. Used to colour bones by side.
     // The golfer's chosen colours, falling back to the built in blue and red.
@@ -193,7 +201,14 @@ struct SkeletonOverlay: View {
             // drawn to a guessed position; a pair in the dim band is drawn at
             // reduced opacity, so an occluded limb stays on screen through
             // P5 to P7 instead of flickering out. See the floors note above.
+            // Skipped entirely when the golfer has turned connecting lines off,
+            // which leaves the joint dots and angle readouts below in place.
+            if drawConnectingLines {
             for (a, b) in Landmarks.BONES {
+                // Per joint line switch: a bone whose either end sits on a joint
+                // the golfer turned off is skipped, so the legs can be stripped
+                // back while the arms stay drawn. See SkeletonSettings.drawsLine.
+                if let settings, !settings.drawsLine(from: a, to: b) { continue }
                 // Foot bones use the same lower floor as the foot joints, so the
                 // ankle to heel to foot index triangle draws when those points
                 // are tracked a little less confidently.
@@ -213,8 +228,18 @@ struct SkeletonOverlay: View {
                 )
             }
 
-            // The spine, drawn separately and brighter, dashed like the web.
-            if showSpine, let top = mid(11, 12), let hip = mid(23, 24) {
+            /*
+              The spine, drawn separately and brighter, dashed like the web. It
+              spans the shoulder and hip midpoints, so it follows those four
+              joints' line switches: turning both shoulders or both hips off takes
+              the spine with them, which is what a golfer stripping the torso back
+              expects.
+            */
+            let spineOn = settings.map { s in
+                (s.setting(for: .leftShoulder).showLine || s.setting(for: .rightShoulder).showLine)
+                    && (s.setting(for: .leftHip).showLine || s.setting(for: .rightHip).showLine)
+            } ?? true
+            if showSpine, spineOn, let top = mid(11, 12), let hip = mid(23, 24) {
                 var path = Path()
                 path.move(to: top)
                 path.addLine(to: hip)
@@ -224,6 +249,7 @@ struct SkeletonOverlay: View {
                     style: StrokeStyle(lineWidth: effectiveBoneWidth * 0.9, lineCap: .round, dash: [6, 6])
                 )
             }
+            } // drawConnectingLines: bones and spine
 
             // Joints.
             for i in Landmarks.DRAWN_JOINTS {
@@ -298,8 +324,17 @@ struct SkeletonOverlay: View {
               points clear the foot floor, so a lost foot shows nothing rather
               than a wrong angle. Independent of settings, so the fullscreen
               viewer gets it too.
+
+              The foot triangle is a connecting shape, so it follows the same
+              lines switch as the bones and spine: off drops it and leaves the
+              ankle, heel and toe dots.
             */
+            if drawConnectingLines {
             for foot in Self.feet {
+                // The foot triangle hangs off the ankle, so it follows that
+                // ankle's line switch.
+                if let settings, let key = JointKey.owning(landmark: foot.ankle),
+                   !settings.setting(for: key).showLine { continue }
                 let floor = footFullFloor
                 guard visibility(foot.ankle) >= floor,
                       visibility(foot.heel) >= floor,
@@ -357,13 +392,15 @@ struct SkeletonOverlay: View {
                     layer.draw(resolved, at: labelPoint, anchor: .center)
                 }
             }
+            } // drawConnectingLines: foot triangles
 
             /*
               Joint angle labels.
 
               Only where a joint has two clear adjacent segments does an angle read
-              as anything, so this draws for the elbows and knees: the elbow angle
-              is shoulder to elbow to wrist, the knee angle is hip to knee to ankle.
+              as anything, and every joint the sheet exposes has two: the shoulder,
+              elbow, wrist, hip, knee and ankle on both sides, listed with their
+              segment pairs in `angleJoints` below.
 
               Inner and outer are independent toggles and both can be on at once,
               so each is drawn in its own `if` rather than chosen between. The
@@ -397,6 +434,21 @@ struct SkeletonOverlay: View {
                     let u = (ux / lu, uy / lu)
                     let w = (wx / lw, wy / lw)
 
+                    /*
+                      How much room this joint actually has for an arc.
+
+                      The style carries a radius in points, which is a fixed size
+                      on screen and takes no account of how big the golfer is in
+                      frame or how short the limb is. A 26 point arc at an ankle
+                      whose shin is 30 points long swallows the whole shin and
+                      spills past the knee, which is the uneven, overlapping
+                      readout the frame audits flagged. Handing the shorter of the
+                      two adjacent limbs to the readout lets it cap itself, so the
+                      arc always sits inside the bend it measures, at every zoom
+                      level and on every joint.
+                    */
+                    let limbSpan = min(lu, lw)
+
                     // Inner angle: sweep the short way from one limb to the other,
                     // so the arc and its label sit inside the bend.
                     if s.innerAngle {
@@ -406,6 +458,7 @@ struct SkeletonOverlay: View {
                             vertex: b,
                             startDir: u,
                             sweep: sweep,
+                            limbSpan: limbSpan,
                             showArc: style.showArc,
                             arcRadius: CGFloat(style.arcRadius),
                             arcThickness: CGFloat(style.arcThickness),
@@ -428,6 +481,7 @@ struct SkeletonOverlay: View {
                             vertex: b,
                             startDir: m,
                             sweep: sweep,
+                            limbSpan: limbSpan,
                             showArc: style.showArc,
                             arcRadius: CGFloat(style.arcRadius),
                             arcThickness: CGFloat(style.arcThickness),
@@ -461,6 +515,7 @@ struct SkeletonOverlay: View {
         vertex: CGPoint,
         startDir: (Double, Double),
         sweep: Double,
+        limbSpan: Double,
         showArc: Bool,
         arcRadius: CGFloat,
         arcThickness: CGFloat,
@@ -470,56 +525,156 @@ struct SkeletonOverlay: View {
         fontColorHex: String,
         in context: GraphicsContext
     ) {
+        /*
+          The radius actually used, capped to the joint it belongs to.
+
+          The style's radius is a request, not a command. Half the shorter
+          adjacent limb is the ceiling: at that size the arc reaches halfway to
+          the next joint and stops, so it always reads as belonging to this bend
+          and never crosses the neighbouring one. A floor keeps it from
+          collapsing to nothing on a foreshortened limb, and the whole thing is
+          clamped rather than scaled so a golfer who asks for a small arc still
+          gets a small arc on a long limb.
+        */
+        let ceiling = CGFloat(limbSpan) * 0.5
+        let radius = max(9, min(arcRadius, ceiling))
+        let colour = Color(hex: arcColorHex)
+
         if showArc {
-            let steps = 24
+            let steps = 32
             var arc = Path()
             for k in 0...steps {
                 let t = sweep * Double(k) / Double(steps)
                 let ct = cos(t), st = sin(t)
                 let dx = startDir.0 * ct - startDir.1 * st
                 let dy = startDir.0 * st + startDir.1 * ct
-                let pt = CGPoint(x: vertex.x + CGFloat(dx) * arcRadius,
-                                 y: vertex.y + CGFloat(dy) * arcRadius)
+                let pt = CGPoint(x: vertex.x + CGFloat(dx) * radius,
+                                 y: vertex.y + CGFloat(dy) * radius)
                 if k == 0 { arc.move(to: pt) } else { arc.addLine(to: pt) }
             }
+            /*
+              A dark backing stroke under the bright one. A single thin lime arc
+              over sunlit grass is nearly invisible in exactly the frames a golfer
+              wants to read; laying the same path down first in translucent black,
+              two points wider, gives it an edge on any background without
+              thickening the arc itself.
+            */
             context.stroke(
                 arc,
-                with: .color(Color(hex: arcColorHex)),
+                with: .color(.black.opacity(0.45)),
+                style: StrokeStyle(lineWidth: arcThickness + 2, lineCap: .round, lineJoin: .round)
+            )
+            context.stroke(
+                arc,
+                with: .color(colour),
                 style: StrokeStyle(lineWidth: arcThickness, lineCap: .round, lineJoin: .round)
             )
+
+            /*
+              Two short ticks closing the arc onto the limbs it measures, so the
+              sweep reads as a measurement between two segments rather than as a
+              stray curve floating near a joint.
+            */
+            for t in [0, sweep] {
+                let ct = cos(t), st = sin(t)
+                let dx = startDir.0 * ct - startDir.1 * st
+                let dy = startDir.0 * st + startDir.1 * ct
+                var tick = Path()
+                tick.move(to: CGPoint(x: vertex.x + CGFloat(dx) * (radius - arcThickness),
+                                      y: vertex.y + CGFloat(dy) * (radius - arcThickness)))
+                tick.addLine(to: CGPoint(x: vertex.x + CGFloat(dx) * (radius + arcThickness * 1.6),
+                                         y: vertex.y + CGFloat(dy) * (radius + arcThickness * 1.6)))
+                context.stroke(
+                    tick,
+                    with: .color(colour.opacity(0.9)),
+                    style: StrokeStyle(lineWidth: arcThickness * 0.8, lineCap: .round)
+                )
+            }
         }
 
         guard showDegrees else { return }
 
-        // Label sits along the bisector of the swept angle, just past the arc,
-        // so it lands on the correct side without overlapping the limbs.
+        /*
+          The label sits on the bisector of the swept angle, just past the arc.
+
+          Rotating the start direction by half the sweep lands exactly between the
+          two limbs, which is the one direction that cannot collide with either of
+          them. The gap past the arc scales with the text, so a large font clears
+          the arc by the same visual margin a small one does instead of sitting on
+          top of it.
+        */
         let half = sweep / 2
         let ch = cos(half), sh = sin(half)
         let bx = startDir.0 * ch - startDir.1 * sh
         let by = startDir.0 * sh + startDir.1 * ch
-        let labelRadius: CGFloat = showArc ? arcRadius + 12 : 16
+        let labelRadius: CGFloat = (showArc ? radius : 0) + fontSize * 0.75 + 6
         let labelPoint = CGPoint(x: vertex.x + CGFloat(bx) * labelRadius,
                                  y: vertex.y + CGFloat(by) * labelRadius)
 
         let text = "\(Int(shown.rounded()))\u{00b0}"
         let resolved = context.resolve(
             Text(text)
-                .font(.system(size: fontSize, weight: .semibold))
+                .font(.system(size: fontSize, weight: .bold, design: .rounded))
                 .foregroundStyle(Color(hex: fontColorHex))
         )
-        context.drawLayer { layer in
-            layer.addFilter(.shadow(color: .black.opacity(0.7), radius: 2, x: 0, y: 1))
-            layer.draw(resolved, at: labelPoint, anchor: .center)
+        /*
+          The number is outlined rather than shadowed.
+
+          A drop shadow only darkens one side, so a bright number over a bright
+          sky still loses its top edge. Drawing the same glyphs in near black at
+          eight offsets around the point and the coloured ones on top gives a true
+          outline, which is what keeps these readable over grass, sky and a white
+          shirt alike, and it is why the reference readouts stay crisp wherever
+          they land.
+        */
+        let outline = context.resolve(
+            Text(text)
+                .font(.system(size: fontSize, weight: .bold, design: .rounded))
+                .foregroundStyle(Color.black.opacity(0.85))
+        )
+        let ring: CGFloat = max(1, fontSize * 0.11)
+        for angle in stride(from: 0.0, to: 2 * Double.pi, by: Double.pi / 4) {
+            let offset = CGPoint(x: labelPoint.x + CGFloat(cos(angle)) * ring,
+                                 y: labelPoint.y + CGFloat(sin(angle)) * ring)
+            context.draw(outline, at: offset, anchor: .center)
         }
+        context.draw(resolved, at: labelPoint, anchor: .center)
     }
 
-    // Joints whose angle is meaningful, with the two landmarks that form the
-    // segments meeting there.
+    /*
+      Joints whose angle is meaningful, with the two landmarks that form the
+      segments meeting there. All six joint types both sides now, so every row
+      the settings sheet exposes a toggle for actually draws a number when it is
+      turned on. Before, only the elbows and knees were listed, so the shoulder,
+      wrist, hip and ankle toggles did nothing.
+
+      Each vertex sits between the two named landmarks:
+        shoulder   elbow to shoulder to hip   (the arm off the torso)
+        elbow      shoulder to elbow to wrist
+        wrist      elbow to wrist to index    (the hand off the forearm)
+        hip        shoulder to hip to knee    (the thigh off the torso)
+        knee       hip to knee to ankle
+        ankle      knee to ankle to foot index
+
+      The angle itself is measured in the same projected 2D space the arc is
+      drawn in, by `interiorAngle` below, so the printed number always agrees with
+      the sweep on screen. (The brief named a Geometry.interiorAngleDegrees
+      helper; there is no such function in the codebase, and a 3D world angle
+      would not match the 2D arc, so the projected measure is used instead.)
+    */
     private static let angleJoints: [(JointKey, (Int, Int))] = [
+        (.leftShoulder, (Landmarks.LEFT_ELBOW, Landmarks.LEFT_HIP)),
+        (.rightShoulder, (Landmarks.RIGHT_ELBOW, Landmarks.RIGHT_HIP)),
         (.leftElbow, (Landmarks.LEFT_SHOULDER, Landmarks.LEFT_WRIST)),
         (.rightElbow, (Landmarks.RIGHT_SHOULDER, Landmarks.RIGHT_WRIST)),
+        (.leftWrist, (Landmarks.LEFT_ELBOW, Landmarks.LEFT_INDEX)),
+        (.rightWrist, (Landmarks.RIGHT_ELBOW, Landmarks.RIGHT_INDEX)),
+        (.leftHip, (Landmarks.LEFT_SHOULDER, Landmarks.LEFT_KNEE)),
+        (.rightHip, (Landmarks.RIGHT_SHOULDER, Landmarks.RIGHT_KNEE)),
         (.leftKnee, (Landmarks.LEFT_HIP, Landmarks.LEFT_ANKLE)),
         (.rightKnee, (Landmarks.RIGHT_HIP, Landmarks.RIGHT_ANKLE)),
+        (.leftAnkle, (Landmarks.LEFT_KNEE, Landmarks.LEFT_FOOT_INDEX)),
+        (.rightAnkle, (Landmarks.RIGHT_KNEE, Landmarks.RIGHT_FOOT_INDEX)),
     ]
 
     // Each foot's three landmarks, for the triangle and the roll angle. Ankle
@@ -539,3 +694,4 @@ struct SkeletonOverlay: View {
         return atan2(abs(cross), dot) * 180 / .pi
     }
 }
+

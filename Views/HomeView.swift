@@ -43,10 +43,6 @@ struct HomeView: View {
 
                 orbit
 
-                if let last {
-                    lastSwingCard(last)
-                }
-
                 if store.swings.isEmpty {
                     Text("Nothing recorded yet. One swing and this fills with your own numbers.")
                         .font(.body(TypeScale.small))
@@ -240,39 +236,6 @@ struct HomeView: View {
         ]
     }
 
-    // MARK: Last swing
-
-    private func lastSwingCard(_ swing: SwingRecord) -> some View {
-        Button {
-            store.openSwing(id: swing.id, sharedId: swing.id)
-        } label: {
-            HStack(spacing: 14) {
-                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .fill(Tok.turf700)
-                    .frame(width: 54, height: 54)
-
-                VStack(alignment: .leading, spacing: 4) {
-                    Eyebrow(text: "Last swing")
-                    Text(swing.diagnosis?.headline ?? "Not scored")
-                        .font(.serif(TypeScale.head))
-                        .foregroundStyle(Tok.bone)
-                        .lineLimit(2)
-                        .multilineTextAlignment(.leading)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-
-                if let overall = swing.scores?.overall {
-                    Text("\(overall)")
-                        .font(.data(TypeScale.title))
-                        .foregroundStyle(Tok.citrus)
-                }
-            }
-            .padding(Tok.s4)
-            .glass()
-        }
-        .buttonStyle(PressScale())
-        .padding(.top, Tok.s5)
-    }
 }
 
 // MARK: - Halo
@@ -325,3 +288,4 @@ struct Halo: View {
         .allowsHitTesting(false)
     }
 }
+

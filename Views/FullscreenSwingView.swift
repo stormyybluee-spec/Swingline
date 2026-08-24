@@ -521,6 +521,8 @@ struct FullscreenSwingView: View {
                     markerPalette: .standard,
                     showTraces: settings3D.showTraces,
                     showGrid: settings3D.showGrid,
+                    showConnectingLines: skeleton?.showConnectingLines ?? true,
+                    hiddenLineJoints: skeleton?.hiddenLineJoints ?? [],
                     controls: controls3D,
                     isUnlocked: settings3D.isUnlocked
                 )
@@ -1887,3 +1889,4 @@ struct SpeedPickerView: View {
         return "\(speed.formatted(.number.precision(.fractionLength(0...2))))x"
     }
 }
+

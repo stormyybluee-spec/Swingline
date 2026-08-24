@@ -62,6 +62,13 @@ struct SceneKitView: UIViewRepresentable {
     var markerPalette: JointMarkerPalette = .standard
     var showTraces: Bool = true
     var showGrid: Bool = true
+    /* Whether the body segments (the connecting lines between joints) are drawn.
+       Off leaves the joint markers, so the figure reads as a dot skeleton. Mirrors
+       the "Show connecting lines" switch the 2D overlay obeys. */
+    var showConnectingLines: Bool = true
+    /* Joints whose own connecting lines the golfer switched off, from the
+       skeleton sheet. Empty in the common case. */
+    var hiddenLineJoints: Set<JointKey> = []
 
     // Interaction. Owned by the host so its buttons can drive the same object.
     let controls: SceneKitControls
@@ -78,6 +85,8 @@ struct SceneKitView: UIViewRepresentable {
         var pinchGesture: UIPinchGestureRecognizer?
         var tapGesture: UITapGestureRecognizer?
         var lastFrameIndex: Int = -1
+        var lastConnectingLines: Bool = true
+        var lastHiddenJoints: Set<JointKey> = []
     }
 
     func makeCoordinator() -> Coordinator { Coordinator() }
@@ -137,7 +146,13 @@ struct SceneKitView: UIViewRepresentable {
             style: jointColorStyle
         )
         root.addChildNode(rig.node)
+        // Honour the connecting lines switch from the first paint, so the figure
+        // never briefly shows its limbs before the setting is applied.
+        rig.setConnectingLinesVisible(showConnectingLines)
+        rig.setHiddenLineJoints(hiddenLineJoints)
         context.coordinator.rig = rig
+        context.coordinator.lastConnectingLines = showConnectingLines
+        context.coordinator.lastHiddenJoints = hiddenLineJoints
 
         // Traces.
         if showTraces {
@@ -200,11 +215,27 @@ struct SceneKitView: UIViewRepresentable {
         context.coordinator.rig?.setJointColorStyle(jointColorStyle)
         context.coordinator.rig?.setDominantHand(dominantHand)
 
+        /* Hide or show the body segments when the connecting lines switch changes.
+           No op when it did not, so calling it on every update is free. */
+        var linesChanged = context.coordinator.lastConnectingLines != showConnectingLines
+        if linesChanged {
+            context.coordinator.rig?.setConnectingLinesVisible(showConnectingLines)
+            context.coordinator.lastConnectingLines = showConnectingLines
+        }
+        /* Per joint line switches. Compared as a set so a change at any one joint
+           is caught, and applied before the frame is placed so a newly suppressed
+           segment is not shown for one frame first. */
+        if context.coordinator.lastHiddenJoints != hiddenLineJoints {
+            context.coordinator.rig?.setHiddenLineJoints(hiddenLineJoints)
+            context.coordinator.lastHiddenJoints = hiddenLineJoints
+            linesChanged = true
+        }
+
         if context.coordinator.lastFrameIndex != frameIndex {
             apply(context.coordinator, frameIndex: frameIndex, view: view)
-        } else if styleChanged {
-            /* The frame did not move but the marker colours did, so one redraw is
-               still needed to show them. */
+        } else if styleChanged || linesChanged {
+            /* The frame did not move but the marker colours or the body visibility
+               did, so one redraw is still needed to show the change. */
             view.setNeedsDisplay()
         }
     }
@@ -355,3 +386,4 @@ struct SceneKitView: UIViewRepresentable {
         return flattened
     }
 }
+

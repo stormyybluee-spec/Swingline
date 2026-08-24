@@ -91,7 +91,16 @@ struct SwingThumbBox: View {
               4.0 / 3.0 is written out rather than read from a constant so this
               file states its own shape. It matches AppStore.thumbSize, 640x480.
             */
-            Tok.turf800
+            /*
+              A frosted glass base rather than the old flat turf fill: an
+              ultraThinMaterial pane behind the thumbnail so an empty or failed
+              tile reads as a translucent card, and so the whole grid picks up the
+              glassmorphism look. The image still fills the box with scaledToFill
+              and is clipped, so a loaded thumbnail covers the material entirely
+              and only the shape it holds shows through.
+            */
+            Rectangle()
+                .fill(.ultraThinMaterial)
                 .aspectRatio(4.0 / 3.0, contentMode: .fit)
                 .overlay {
                     if let path, let image = ThumbCache.shared.image(at: path) {
@@ -115,10 +124,43 @@ struct SwingThumbBox: View {
             }
         }
         .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+        /*
+          Glass sheen: a soft light to dark wash across the tile so it reads as a
+          pane catching light rather than a flat photo. Faint on purpose, so the
+          thumbnail underneath stays legible.
+        */
         .overlay {
             RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                .strokeBorder(isSelected ? Tok.citrus : Tok.line, lineWidth: isSelected ? 2 : 1)
+                .fill(
+                    LinearGradient(
+                        colors: [Color.white.opacity(0.14), Color.clear, Color.black.opacity(0.14)],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    )
+                )
+                .allowsHitTesting(false)
         }
+        /*
+          Border: a hairline glass rim, brightest at the top left where the light
+          catches it, or the citrus selection ring when the tile is ticked.
+        */
+        .overlay {
+            RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                .strokeBorder(
+                    isSelected
+                        ? AnyShapeStyle(Tok.citrus)
+                        : AnyShapeStyle(
+                            LinearGradient(
+                                colors: [Color.white.opacity(0.35), Color.white.opacity(0.06)],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            )
+                        ),
+                    lineWidth: isSelected ? 2 : 1
+                )
+        }
+        // A soft drop shadow lifts the glass tile off the screen behind it.
+        .shadow(color: .black.opacity(0.25), radius: 8, x: 0, y: 4)
         .contentShape(Rectangle())
         .animation(.spring(response: 0.28, dampingFraction: 0.82), value: selectionMode)
         .animation(.spring(response: 0.28, dampingFraction: 0.82), value: isSelected)
@@ -284,3 +326,4 @@ struct BulkDeleteBar: View {
         }
     }
 }
+

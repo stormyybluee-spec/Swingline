@@ -749,6 +749,16 @@ struct SwingTile: View {
                     .font(.data(TypeScale.nano))
                     .foregroundStyle(Tok.bone3)
 
+                // Swing count badge, sitting under the thumbnail with the rest of
+                // the metadata. One swing per record today; see swingCountText.
+                Text(swingCountText)
+                    .font(.data(TypeScale.nano))
+                    .foregroundStyle(Tok.ink)
+                    .padding(.vertical, 3)
+                    .padding(.horizontal, 8)
+                    .background(Capsule().fill(Tok.citrus.opacity(0.85)))
+                    .padding(.top, 2)
+
                 if !swing.analysed {
                     Text(swing.failure ?? "Not scored")
                         .font(.body(TypeScale.nano))
@@ -785,14 +795,36 @@ struct SwingTile: View {
         }
     }
 
-    // Relative time for a swing recorded today, an abbreviated date otherwise.
+    /*
+      The full date and time a swing was recorded, e.g. "Aug 24, 2026 · 7:59 AM".
+
+      The tile used to show a bare abbreviated date, or a relative phrase for
+      today, which dropped the time of day entirely. A golfer who records several
+      swings in one session needs the clock time to tell them apart, so the stamp
+      now always carries both. One shared formatter, since a grid rebuilds these
+      labels on every selection tap.
+    */
+    private static let stampFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "MMM d, yyyy '\u{00b7}' h:mm a"
+        return f
+    }()
+
     private func timeLabel(_ date: Date) -> String {
-        if Calendar.current.isDateInToday(date) {
-            let f = RelativeDateTimeFormatter()
-            f.unitsStyle = .full
-            return f.localizedString(for: date, relativeTo: Date())
-        }
-        return date.formatted(.dateTime.month(.abbreviated).day())
+        Self.stampFormatter.string(from: date)
+    }
+
+    /*
+      Swings folded into this tile.
+
+      SwingRecord has no swing count field, so a record is one swing and the badge
+      reads "1 swing". If a grouped or multi-swing record type is added later, read
+      its count here and the plural handling below carries it.
+    */
+    private var swingCountText: String {
+        let n = 1
+        return "\(n) swing\(n == 1 ? "" : "s")"
     }
 }
 
@@ -999,3 +1031,4 @@ struct PickedMovie: Transferable {
         }
     }
 }
+
