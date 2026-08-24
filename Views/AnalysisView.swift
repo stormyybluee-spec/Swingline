@@ -445,18 +445,6 @@ struct AnalysisView: View {
                 PlaybackControls(playback: playback, phaseMarks: phaseMarks)
             }
 
-            if let metricSource {
-                measurementBadge
-                metricsHeader
-                MetricsBar(
-                    source: metricSource,
-                    frameIndex: playback.frameIndex,
-                    selected: selectedMetrics.wrappedValue,
-                    layout: .grid
-                )
-                .padding(.bottom, Tok.s3)
-            }
-
             Text(headline)
                 .font(.serif(TypeScale.title))
                 .foregroundStyle(Tok.bone)
@@ -479,6 +467,28 @@ struct AnalysisView: View {
 
             fullBreakdownSection
             diagnosticReportSection
+
+            /*
+              The metrics, at the foot of the page.
+
+              They used to sit directly under the transport, between the video and
+              the headline, where they pushed the diagnosis and the category rows
+              off the first screen and took the space a golfer wants for the
+              picture. Down here the clip and its verdict lead, and the numbers are
+              where somebody who wants to read them goes looking, rather than
+              something everybody has to scroll past.
+            */
+            if let metricSource {
+                measurementBadge
+                metricsHeader
+                MetricsBar(
+                    source: metricSource,
+                    frameIndex: playback.frameIndex,
+                    selected: selectedMetrics.wrappedValue,
+                    layout: .grid
+                )
+                .padding(.bottom, Tok.s3)
+            }
 
             HStack(spacing: Tok.s3) {
                 Button {

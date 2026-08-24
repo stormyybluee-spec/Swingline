@@ -12,7 +12,7 @@
 //  which for this job is most of the value, because the useful thing a coach
 //  says is almost always a specific fact about you at the right moment.
 //
-//  TEMPORARILY BEHIND A MAINTENANCE SCREEN. The chat, drill and tempo panels
+//  TEMPORARILY BEHIND AN UPGRADE SCREEN. The chat, drill and tempo panels
 //  are parked while the retrieval layer is reworked. Rather than show a shell
 //  that looks broken, the screen states plainly that the coach is coming back,
 //  with a single way out. The old panels can be restored from version control
@@ -36,17 +36,17 @@ struct CoachView: View {
                     .font(.system(size: 34, weight: .regular))
                     .foregroundStyle(Tok.citrus)
 
-                Text("UNDER MAINTENANCE")
+                Text("COMING SOON")
                     .font(.data(TypeScale.small))
                     .tracking(2)
                     .foregroundStyle(Tok.bone2)
 
-                Text("Coming back Soon!")
+                Text("Coming soon for a system upgrade")
                     .font(.serif(TypeScale.title))
                     .foregroundStyle(Tok.bone)
                     .multilineTextAlignment(.center)
 
-                Text("The coach is parked while we rebuild it. Your swings, scores and history are all untouched.")
+                Text("The coach is parked while the system is upgraded. Your swings, scores and history are all untouched.")
                     .font(.body(TypeScale.small))
                     .foregroundStyle(Tok.bone3)
                     .multilineTextAlignment(.center)
@@ -81,3 +81,4 @@ struct CoachView: View {
         }
     }
 }
+
