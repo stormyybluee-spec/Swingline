@@ -16,6 +16,7 @@
 //
 
 import SwiftUI
+import UIKit
 
 struct PlaybackControls: View {
     let playback: PlaybackState
@@ -25,16 +26,37 @@ struct PlaybackControls: View {
     */
     var phaseMarks: [PhaseMark] = []
 
+    /*
+      Feedback for the scrubber.
+
+      A selection generator rather than an impact one: stepping the play head
+      through frames is a discrete pick along a track, which is exactly what
+      selectionChanged is for, and it stays light enough to fire many times a
+      second without the buzz turning into a rumble. Held as a property so the
+      Taptic Engine is not re-armed on every frame, and prepared when a drag
+      begins so the first tick is not late.
+    */
+    @State private var haptics = UISelectionFeedbackGenerator()
+
     var body: some View {
+        /*
+          One row for the whole transport, play first.
+
+          The old layout stacked a 56 point circle between two spacers, which set
+          the row's height on its own and pushed the metrics and the diagnostic
+          report down the screen. Everything now sits on a single line reading
+          left to right: play, the two frame steps beside it, then loop and speed
+          pushed to the trailing edge. Same controls, one row, and the play button
+          lands where a thumb already rests.
+        */
         VStack(spacing: Tok.s2) {
             scrubber
-            HStack(spacing: Tok.s4) {
-                loopButton
-                Spacer()
-                stepButton(system: "backward.frame.fill") { playback.stepBackward() }
+            HStack(spacing: Tok.s2) {
                 playButton
+                stepButton(system: "backward.frame.fill") { playback.stepBackward() }
                 stepButton(system: "forward.frame.fill") { playback.stepForward() }
-                Spacer()
+                Spacer(minLength: Tok.s2)
+                loopButton
                 speedSelector
             }
         }
@@ -113,9 +135,25 @@ struct PlaybackControls: View {
             ) { editing in
                 // Grabbing the scrubber pauses, so the play head sits where the
                 // golfer puts it rather than running out from under them.
-                if editing { playback.pause() }
+                if editing {
+                    playback.pause()
+                    // Warm the Taptic Engine so the first tick of the drag lands
+                    // with the finger rather than a beat behind it.
+                    haptics.prepare()
+                }
             }
             .tint(Tok.citrus)
+            /*
+              One tick per frame crossed while dragging. Driven off the frame
+              index rather than the gesture, so a tick fires exactly when the
+              picture changes, and a scrub that moves within one frame stays
+              silent. Playback moves the same index, so this is gated on the drag
+              having paused it: a clip playing back does not buzz.
+            */
+            .onChange(of: playback.frameIndex) { _, _ in
+                guard !playback.isPlaying else { return }
+                haptics.selectionChanged()
+            }
 
             phaseTicks
 
@@ -146,9 +184,11 @@ struct PlaybackControls: View {
             playback.togglePlay()
         } label: {
             Image(systemName: playback.isPlaying ? "pause.fill" : "play.fill")
-                .font(.system(size: 22, weight: .semibold))
+                .font(.system(size: 17, weight: .bold))
                 .foregroundStyle(Tok.ink)
-                .frame(width: 56, height: 56)
+                // 44 is the smallest comfortable tap target, and it lets the whole
+                // transport sit on one row without the circle setting its height.
+                .frame(width: 44, height: 44)
                 .background(
                     Circle().fill(
                         LinearGradient(
@@ -220,4 +260,5 @@ struct PlaybackControls: View {
         return "\(String(format: "%g", value))x"
     }
 }
+
 

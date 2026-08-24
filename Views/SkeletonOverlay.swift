@@ -381,16 +381,20 @@ struct SkeletonOverlay: View {
                 // it tracks the foot instead of colliding with the shin.
                 let ux = run / len, uy = -rise / len  // back to screen y-down
                 let labelPoint = CGPoint(x: toe.x + CGFloat(ux) * 22, y: toe.y + CGFloat(uy) * 22)
+                /*
+                  Drawn with the same outline the joint angle readouts use, so
+                  every number over the video is styled one way. A one sided drop
+                  shadow left this one losing its top edge against sky, which is
+                  exactly where a lifting heel puts it.
+                */
                 let text = "\(Int(shown.rounded()))\u{00b0}"
-                let resolved = context.resolve(
-                    Text(text)
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(sideColour(foot.ankle))
+                drawOutlined(
+                    text,
+                    at: labelPoint,
+                    fontSize: 13,
+                    colour: sideColour(foot.ankle),
+                    in: context
                 )
-                context.drawLayer { layer in
-                    layer.addFilter(.shadow(color: .black.opacity(0.7), radius: 2, x: 0, y: 1))
-                    layer.draw(resolved, at: labelPoint, anchor: .center)
-                }
             }
             } // drawConnectingLines: foot triangles
 
@@ -470,18 +474,37 @@ struct SkeletonOverlay: View {
                         )
                     }
 
-                    // Outer angle: extend the first limb through the joint and
-                    // sweep to the second. That angle is exactly the supplement,
-                    // and it lands on the outside of the bend.
+                    /*
+                      Outer angle: the reflex angle at the joint, swept the long
+                      way round from one limb to the other.
+
+                      This used to start from the first limb reflected through the
+                      joint and sweep to the second, which measures the supplement,
+                      180 minus the interior. Two things were wrong with that. The
+                      arc began on the reflection rather than on a limb, so it hung
+                      in space with a visible gap at its start, which is the gap in
+                      the reported frames. And the supplement is not the angle on
+                      the outside of a bend: the outside of a 42 degree bend is 318
+                      degrees, not 138.
+
+                      Sweeping the same start direction the other way round fixes
+                      both at once. Subtracting a full turn from the inner sweep
+                      keeps the end direction identical, so the arc still finishes
+                      exactly on the second limb, but it now travels the long way
+                      and starts exactly on the first. Both ends land on real
+                      limbs, the gap is gone, and the number is 360 minus the
+                      interior, which is what the reference readouts show.
+                    */
                     if s.outerAngle {
-                        let m = (-u.0, -u.1)
-                        let sweep = atan2(m.0 * w.1 - m.1 * w.0, m.0 * w.0 + m.1 * w.1)
+                        let inner = atan2(u.0 * w.1 - u.1 * w.0, u.0 * w.0 + u.1 * w.1)
+                        let reflex = inner - (inner >= 0 ? 2 * Double.pi : -2 * Double.pi)
                         drawAngleReadout(
-                            shown: 180 - interior,
+                            shown: 360 - interior,
                             vertex: b,
-                            startDir: m,
-                            sweep: sweep,
+                            startDir: u,
+                            sweep: reflex,
                             limbSpan: limbSpan,
+                            reflex: true,
                             showArc: style.showArc,
                             arcRadius: CGFloat(style.arcRadius),
                             arcThickness: CGFloat(style.arcThickness),
@@ -516,6 +539,7 @@ struct SkeletonOverlay: View {
         startDir: (Double, Double),
         sweep: Double,
         limbSpan: Double,
+        reflex: Bool = false,
         showArc: Bool,
         arcRadius: CGFloat,
         arcThickness: CGFloat,
@@ -537,7 +561,14 @@ struct SkeletonOverlay: View {
           gets a small arc on a long limb.
         */
         let ceiling = CGFloat(limbSpan) * 0.5
-        let radius = max(9, min(arcRadius, ceiling))
+        /*
+          A reflex arc wraps the joint rather than sitting inside the bend, so it
+          is pushed out a little further. That is what keeps both readouts legible
+          when a golfer has inner and outer on at the same joint: two arcs at one
+          radius would trace the same circle and read as a single muddled ring.
+          The nudge is a fraction, not a fixed gap, so it holds at every zoom.
+        */
+        let radius = max(9, min(arcRadius, ceiling)) * (reflex ? 1.32 : 1)
         let colour = Color(hex: arcColorHex)
 
         if showArc {
@@ -611,34 +642,50 @@ struct SkeletonOverlay: View {
         let labelPoint = CGPoint(x: vertex.x + CGFloat(bx) * labelRadius,
                                  y: vertex.y + CGFloat(by) * labelRadius)
 
-        let text = "\(Int(shown.rounded()))\u{00b0}"
-        let resolved = context.resolve(
-            Text(text)
-                .font(.system(size: fontSize, weight: .bold, design: .rounded))
-                .foregroundStyle(Color(hex: fontColorHex))
+        drawOutlined(
+            "\(Int(shown.rounded()))\u{00b0}",
+            at: labelPoint,
+            fontSize: fontSize,
+            colour: Color(hex: fontColorHex),
+            in: context
         )
-        /*
-          The number is outlined rather than shadowed.
+    }
 
-          A drop shadow only darkens one side, so a bright number over a bright
-          sky still loses its top edge. Drawing the same glyphs in near black at
-          eight offsets around the point and the coloured ones on top gives a true
-          outline, which is what keeps these readable over grass, sky and a white
-          shirt alike, and it is why the reference readouts stay crisp wherever
-          they land.
-        */
+    /*
+      A number over the video, outlined rather than shadowed.
+
+      A drop shadow only darkens one side, so a bright figure over a bright sky
+      still loses its top edge. Drawing the same glyphs in near black at eight
+      offsets around the point and the coloured ones on top gives a true outline,
+      which is what keeps these readable over grass, sky and a white shirt alike.
+      Shared by the joint angle readouts and the foot roll labels so every number
+      the overlay prints is styled the same way.
+    */
+    private func drawOutlined(
+        _ text: String,
+        at point: CGPoint,
+        fontSize: CGFloat,
+        colour: Color,
+        in context: GraphicsContext
+    ) {
+        let font = Font.system(size: fontSize, weight: .bold, design: .rounded)
         let outline = context.resolve(
-            Text(text)
-                .font(.system(size: fontSize, weight: .bold, design: .rounded))
-                .foregroundStyle(Color.black.opacity(0.85))
+            Text(text).font(font).foregroundStyle(Color.black.opacity(0.85))
         )
         let ring: CGFloat = max(1, fontSize * 0.11)
         for angle in stride(from: 0.0, to: 2 * Double.pi, by: Double.pi / 4) {
-            let offset = CGPoint(x: labelPoint.x + CGFloat(cos(angle)) * ring,
-                                 y: labelPoint.y + CGFloat(sin(angle)) * ring)
-            context.draw(outline, at: offset, anchor: .center)
+            context.draw(
+                outline,
+                at: CGPoint(x: point.x + CGFloat(cos(angle)) * ring,
+                            y: point.y + CGFloat(sin(angle)) * ring),
+                anchor: .center
+            )
         }
-        context.draw(resolved, at: labelPoint, anchor: .center)
+        context.draw(
+            context.resolve(Text(text).font(font).foregroundStyle(colour)),
+            at: point,
+            anchor: .center
+        )
     }
 
     /*

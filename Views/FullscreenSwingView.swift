@@ -189,6 +189,30 @@ struct FullscreenSwingView: View {
       the kinematic sequence. Both halves read the same frame index, so they can
       never drift apart.
     */
+    // Drives the slow fade that marks a live recording. Set by recordButton.
+    @State private var recordPulse = false
+
+    /*
+      Where the two panel divider sits, as the top panel's share of the stage.
+
+      A fraction rather than a point offset so the split survives a rotation with
+      its proportions intact. Clamped to the range below whenever it is dragged,
+      so neither panel can be squeezed to nothing and lose its own selector with
+      it. Screen state, not a setting: a golfer sizing the panels for one clip is
+      not choosing a permanent layout.
+    */
+    @State private var splitFraction: CGFloat = 0.5
+    // Live while the divider is under a finger, for the highlight.
+    @State private var splitDragging = false
+    /*
+      The fraction the current drag started from. @GestureState so it resets
+      itself to nil the moment the finger lifts, which is what makes the next drag
+      latch its own starting point rather than inheriting the last one.
+    */
+    @GestureState private var splitStart: CGFloat?
+    // Neither panel drops below a fifth of the stage.
+    private static let splitRange: ClosedRange<CGFloat> = 0.2...0.8
+
     @State private var twoPanel = false
     @State private var panelB: Panel = .threeD
     // Drawing takes the stage's touches while it is on, so a stroke never
@@ -364,13 +388,28 @@ struct FullscreenSwingView: View {
         GeometryReader { geo in
             Group {
                 if twoPanel {
-                    VStack(spacing: 2) {
-                        panelContent($panel, in: CGSize(width: geo.size.width, height: geo.size.height / 2))
-                            .frame(width: geo.size.width, height: geo.size.height / 2)
+                    /*
+                      Two stages with a divider the golfer can drag.
+
+                      A fixed half and half split assumes both panels deserve the
+                      same room, which they rarely do: studying the 2D overlay
+                      against the video wants most of the screen, and the 3D figure
+                      or the sequence strip is a reference glance. The split is a
+                      fraction of the stage rather than a point offset, so it holds
+                      its proportion through a rotation instead of leaving one
+                      panel nearly closed.
+                    */
+                    let bar: CGFloat = 22
+                    let usable = max(0, geo.size.height - bar)
+                    let topHeight = usable * splitFraction
+                    let bottomHeight = usable - topHeight
+                    VStack(spacing: 0) {
+                        panelContent($panel, in: CGSize(width: geo.size.width, height: topHeight))
+                            .frame(width: geo.size.width, height: topHeight)
                             .clipped()
-                        Rectangle().fill(Tok.line).frame(height: 1)
-                        panelContent($panelB, in: CGSize(width: geo.size.width, height: geo.size.height / 2))
-                            .frame(width: geo.size.width, height: geo.size.height / 2)
+                        splitHandle(stageHeight: usable, barHeight: bar)
+                        panelContent($panelB, in: CGSize(width: geo.size.width, height: bottomHeight))
+                            .frame(width: geo.size.width, height: bottomHeight)
                             .clipped()
                     }
                 } else {
@@ -650,9 +689,24 @@ struct FullscreenSwingView: View {
 
                 Spacer()
 
+                /*
+                  Record, and while recording, a stop beside it.
+
+                  One button that swapped its own glyph between record and stop
+                  asked the golfer to read an icon mid take to know what a tap
+                  would do, and a mistaken tap either loses the take or fails to
+                  end it. Now the record button simply turns red and stays put as
+                  the state indicator, and a separate square stop appears to its
+                  right as the only control that ends the take. Start and stop are
+                  never the same target, so neither can be hit by accident. There
+                  is no pause: start, stop, save, which is what stopToURL already
+                  does.
+                */
                 if let recorder {
-                    iconButton(system: recorder.isRecording ? "stop.circle.fill" : "record.circle") {
-                        if recorder.isRecording { recorder.stopToURL() } else { recorder.start() }
+                    recordButton(recorder)
+                    if recorder.isRecording {
+                        stopRecordingButton(recorder)
+                            .transition(.move(edge: .trailing).combined(with: .opacity))
                     }
                 }
                 if let onToggleFacing {
@@ -1155,6 +1209,145 @@ struct FullscreenSwingView: View {
     }
 
     // MARK: - Building blocks
+
+    /*
+      The draggable divider between the two stages.
+
+      Wider than it looks: the visible bar is a few points of line and a grip, but
+      the gesture target is the full bar height, which is what makes it catchable
+      without aiming. The grip is three dots, the one shape that reads as "drag
+      me" without a label, and the whole bar lights citrus while it is held so the
+      golfer can see which thing their finger has hold of.
+
+      The drag is translation based, taken against the fraction the gesture began
+      at rather than the live one, so a slow drag cannot accumulate rounding drift
+      and creep away from the finger.
+    */
+    private func splitHandle(stageHeight: CGFloat, barHeight: CGFloat) -> some View {
+        let active = splitDragging
+        return ZStack {
+            Rectangle()
+                .fill(active ? Tok.citrus.opacity(0.18) : Color.white.opacity(0.04))
+            VStack(spacing: 0) {
+                Rectangle()
+                    .fill(active ? Tok.citrus : Tok.line)
+                    .frame(height: active ? 2 : 1)
+            }
+            HStack(spacing: 4) {
+                ForEach(0..<3, id: \.self) { _ in
+                    Circle()
+                        .fill(active ? Tok.citrus : Tok.bone3)
+                        .frame(width: 4, height: 4)
+                }
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 5)
+            .background(
+                Capsule().fill(Color.black.opacity(active ? 0.5 : 0.35))
+            )
+        }
+        .frame(height: barHeight)
+        .contentShape(Rectangle())
+        .gesture(
+            DragGesture(minimumDistance: 0)
+                .updating($splitStart) { _, start, _ in
+                    // Latched once per gesture, so every translation is measured
+                    // from where the drag began.
+                    if start == nil { start = splitFraction }
+                }
+                .onChanged { value in
+                    guard stageHeight > 1 else { return }
+                    let base = splitStart ?? splitFraction
+                    let next = base + value.translation.height / stageHeight
+                    splitFraction = min(max(next, Self.splitRange.lowerBound), Self.splitRange.upperBound)
+                    if !splitDragging {
+                        withAnimation(.easeOut(duration: 0.12)) { splitDragging = true }
+                    }
+                }
+                .onEnded { _ in
+                    withAnimation(.easeOut(duration: 0.18)) { splitDragging = false }
+                }
+        )
+        // A double tap puts the split back to even, which is faster than
+        // dragging it back by eye.
+        .onTapGesture(count: 2) {
+            withAnimation(.spring(response: 0.3, dampingFraction: 0.85)) {
+                splitFraction = 0.5
+            }
+        }
+        .accessibilityLabel("Panel divider, drag to resize")
+    }
+
+    /*
+      The record button.
+
+      Red and filled while a take is running, so the state is readable at a glance
+      from across the room rather than from a glyph. It starts a take and does
+      nothing else: while recording it is inert, because stopping belongs to the
+      stop button beside it. A slow pulse marks it as live without the flashing
+      that would fight the video behind it.
+    */
+    @ViewBuilder
+    private func recordButton(_ recorder: ReplayKitManager) -> some View {
+        let live = recorder.isRecording
+        Button {
+            guard !live else { return }
+            recorder.start()
+        } label: {
+            Image(systemName: live ? "record.circle.fill" : "record.circle")
+                .font(.system(size: 19, weight: .regular))
+                .foregroundStyle(live ? Color(red: 1, green: 0.23, blue: 0.19) : Tok.bone)
+                .frame(width: 38, height: 38)
+                .background(
+                    Circle().fill(
+                        live
+                            ? Color(red: 1, green: 0.23, blue: 0.19).opacity(0.18)
+                            : Color.white.opacity(0.06)
+                    )
+                )
+                .overlay {
+                    if live {
+                        Circle().strokeBorder(
+                            Color(red: 1, green: 0.23, blue: 0.19).opacity(0.9),
+                            lineWidth: 1.5
+                        )
+                    }
+                }
+                .opacity(live && recordPulse ? 0.55 : 1)
+        }
+        .buttonStyle(PressScale())
+        .disabled(live)
+        .accessibilityLabel(live ? "Recording" : "Start screen recording")
+        .onChange(of: live) { _, isLive in
+            recordPulse = false
+            guard isLive else { return }
+            withAnimation(.easeInOut(duration: 0.9).repeatForever(autoreverses: true)) {
+                recordPulse = true
+            }
+        }
+    }
+
+    /*
+      Stop, and with it save.
+
+      A square, the one shape every recorder in the world uses for stop, and it
+      exists only while a take is running. stopToURL writes the finished movie and
+      saves it to Photos, so this is the whole of the end of a take: no pause, no
+      confirm, no editor.
+    */
+    private func stopRecordingButton(_ recorder: ReplayKitManager) -> some View {
+        Button {
+            recorder.stopToURL()
+        } label: {
+            RoundedRectangle(cornerRadius: 3, style: .continuous)
+                .fill(Tok.bone)
+                .frame(width: 14, height: 14)
+                .frame(width: 38, height: 38)
+                .background(Circle().fill(Color.white.opacity(0.14)))
+        }
+        .buttonStyle(PressScale())
+        .accessibilityLabel("Stop recording and save to Photos")
+    }
 
     private func iconButton(system: String, active: Bool = false, action: @escaping () -> Void) -> some View {
         Button(action: action) {
