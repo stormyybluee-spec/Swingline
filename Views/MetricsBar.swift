@@ -425,6 +425,11 @@ struct MetricsBar: View {
     @State private var pageHeight: CGFloat = 0
     private static let pageDotsSpace: CGFloat = 26
     private static let pageHeightFloor: CGFloat = 84
+    /* The shape of one swipeable page. Held here rather than written into the
+       grid so the padding that keeps every page two rows tall and the grid it
+       pads can never disagree about how many cells a page has. */
+    private static let columnsPerPage = 4
+    private static let rowsPerPage = 2
 
     // Registry order, filtered to the chosen ones, so the bar order is stable,
     // then minus anything this camera angle cannot honestly measure. Hiding a
@@ -517,12 +522,40 @@ struct MetricsBar: View {
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, Tok.s4)
             } else {
+                /*
+                  Always two rows, whatever is on the page.
+
+                  With four columns a page holding one to four metrics laid out as
+                  a single row, which made this page shorter than its neighbours.
+                  The TabView takes its height from the tallest page and centres
+                  the shorter ones inside it, so one metric on bar two floated in
+                  the middle of a two row box while the other pages sat at the top.
+                  That is the centring in the report, and it is a layout artefact
+                  rather than a choice anyone made.
+
+                  Padding the page out to a full second row with invisible cards
+                  fixes it at the source: every page is genuinely two rows tall, so
+                  they all report the same height and there is nothing left to
+                  centre. The placeholders are real cards at zero opacity rather
+                  than blank rectangles, so they occupy exactly the height a card
+                  occupies and cannot drift out of step with it, and they are
+                  hidden from VoiceOver so nothing announces an empty slot.
+                */
+                let shown = Array(items.prefix(8))
+                let padded = max(0, Self.rowsPerPage * Self.columnsPerPage - shown.count)
                 LazyVGrid(
-                    columns: Array(repeating: GridItem(.flexible(), spacing: Tok.s2), count: 4),
+                    columns: Array(repeating: GridItem(.flexible(), spacing: Tok.s2), count: Self.columnsPerPage),
                     spacing: Tok.s2
                 ) {
-                    ForEach(Array(items.prefix(8))) { metric in
+                    ForEach(shown) { metric in
                         card(metric, fill: true, compact: true)
+                    }
+                    if padded > 0, let filler = shown.first {
+                        ForEach(0..<padded, id: \.self) { _ in
+                            card(filler, fill: true, compact: true)
+                                .opacity(0)
+                                .accessibilityHidden(true)
+                        }
                     }
                 }
             }

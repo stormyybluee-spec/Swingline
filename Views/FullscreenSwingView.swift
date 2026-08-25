@@ -68,6 +68,7 @@
 import SwiftUI
 import AVFoundation
 import UIKit
+import Photos
 
 struct FullscreenSwingView: View {
 
@@ -168,6 +169,12 @@ struct FullscreenSwingView: View {
 
     // The ball flight placeholder notice, and the trim sheet.
     @State private var ballFlightNoticeOpen = false
+    /*
+      What the download just did, or nil. Shown as a banner over the stage and
+      cleared on a timer, so a save that worked confirms itself and a save that
+      did not says why instead of failing in silence.
+    */
+    @State private var downloadNotice: String?
     @State private var trimOpen = false
 
     // The share export. The task is held so the cancel button can reach it.
@@ -189,6 +196,30 @@ struct FullscreenSwingView: View {
       the kinematic sequence. Both halves read the same frame index, so they can
       never drift apart.
     */
+    // Drives the slow fade that marks a live recording. Set by recordButton.
+    @State private var recordPulse = false
+
+    /*
+      Where the two panel divider sits, as the top panel's share of the stage.
+
+      A fraction rather than a point offset so the split survives a rotation with
+      its proportions intact. Clamped to the range below whenever it is dragged,
+      so neither panel can be squeezed to nothing and lose its own selector with
+      it. Screen state, not a setting: a golfer sizing the panels for one clip is
+      not choosing a permanent layout.
+    */
+    @State private var splitFraction: CGFloat = 0.5
+    // Live while the divider is under a finger, for the highlight.
+    @State private var splitDragging = false
+    /*
+      The fraction the current drag started from. @GestureState so it resets
+      itself to nil the moment the finger lifts, which is what makes the next drag
+      latch its own starting point rather than inheriting the last one.
+    */
+    @GestureState private var splitStart: CGFloat?
+    // Neither panel drops below a fifth of the stage.
+    private static let splitRange: ClosedRange<CGFloat> = 0.2...0.8
+
     @State private var twoPanel = false
     @State private var panelB: Panel = .threeD
     // Drawing takes the stage's touches while it is on, so a stroke never
@@ -293,6 +324,43 @@ struct FullscreenSwingView: View {
             Text("New version coming soon. Stay tuned!")
         }
         /*
+          The download result, as a banner across the top of the stage.
+
+          A banner rather than an alert: the outcome of a save is not a question,
+          so it should not need dismissing. It sits below the top bar, clear of
+          the close and record buttons, and clears itself after a few seconds. A
+          tap dismisses it early for anyone who has already read it.
+        */
+        .overlay(alignment: .top) {
+            if let downloadNotice {
+                Text(downloadNotice)
+                    .font(.body(TypeScale.small))
+                    .foregroundStyle(Tok.bone)
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.vertical, 12)
+                    .padding(.horizontal, 18)
+                    .background(
+                        RoundedRectangle(cornerRadius: Tok.rMd, style: .continuous)
+                            .fill(Color.black.opacity(0.82))
+                    )
+                    .overlay {
+                        RoundedRectangle(cornerRadius: Tok.rMd, style: .continuous)
+                            .strokeBorder(Tok.line, lineWidth: 1)
+                    }
+                    .padding(.horizontal, Tok.s5)
+                    .padding(.top, 108)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+                    .onTapGesture { self.downloadNotice = nil }
+                    .task(id: downloadNotice) {
+                        try? await Task.sleep(nanoseconds: 3_200_000_000)
+                        guard !Task.isCancelled else { return }
+                        self.downloadNotice = nil
+                    }
+            }
+        }
+        .animation(.easeInOut(duration: 0.22), value: downloadNotice)
+        /*
           The text tool's input. Typing here and tapping Done commits a label at
           the controller's pending point, in the current colour and size. The
           sheet is small and drags to dismiss, and Cancel drops the draft.
@@ -364,13 +432,28 @@ struct FullscreenSwingView: View {
         GeometryReader { geo in
             Group {
                 if twoPanel {
-                    VStack(spacing: 2) {
-                        panelContent($panel, in: CGSize(width: geo.size.width, height: geo.size.height / 2))
-                            .frame(width: geo.size.width, height: geo.size.height / 2)
+                    /*
+                      Two stages with a divider the golfer can drag.
+
+                      A fixed half and half split assumes both panels deserve the
+                      same room, which they rarely do: studying the 2D overlay
+                      against the video wants most of the screen, and the 3D figure
+                      or the sequence strip is a reference glance. The split is a
+                      fraction of the stage rather than a point offset, so it holds
+                      its proportion through a rotation instead of leaving one
+                      panel nearly closed.
+                    */
+                    let bar: CGFloat = 22
+                    let usable = max(0, geo.size.height - bar)
+                    let topHeight = usable * splitFraction
+                    let bottomHeight = usable - topHeight
+                    VStack(spacing: 0) {
+                        panelContent($panel, in: CGSize(width: geo.size.width, height: topHeight))
+                            .frame(width: geo.size.width, height: topHeight)
                             .clipped()
-                        Rectangle().fill(Tok.line).frame(height: 1)
-                        panelContent($panelB, in: CGSize(width: geo.size.width, height: geo.size.height / 2))
-                            .frame(width: geo.size.width, height: geo.size.height / 2)
+                        splitHandle(stageHeight: usable, barHeight: bar)
+                        panelContent($panelB, in: CGSize(width: geo.size.width, height: bottomHeight))
+                            .frame(width: geo.size.width, height: bottomHeight)
                             .clipped()
                     }
                 } else {
@@ -521,6 +604,8 @@ struct FullscreenSwingView: View {
                     markerPalette: .standard,
                     showTraces: settings3D.showTraces,
                     showGrid: settings3D.showGrid,
+                    showConnectingLines: skeleton?.showConnectingLines ?? true,
+                    hiddenLineJoints: skeleton?.hiddenLineJoints ?? [],
                     controls: controls3D,
                     isUnlocked: settings3D.isUnlocked
                 )
@@ -648,9 +733,24 @@ struct FullscreenSwingView: View {
 
                 Spacer()
 
+                /*
+                  Record, and while recording, a stop beside it.
+
+                  One button that swapped its own glyph between record and stop
+                  asked the golfer to read an icon mid take to know what a tap
+                  would do, and a mistaken tap either loses the take or fails to
+                  end it. Now the record button simply turns red and stays put as
+                  the state indicator, and a separate square stop appears to its
+                  right as the only control that ends the take. Start and stop are
+                  never the same target, so neither can be hit by accident. There
+                  is no pause: start, stop, save, which is what stopToURL already
+                  does.
+                */
                 if let recorder {
-                    iconButton(system: recorder.isRecording ? "stop.circle.fill" : "record.circle") {
-                        if recorder.isRecording { recorder.stopToURL() } else { recorder.start() }
+                    recordButton(recorder)
+                    if recorder.isRecording {
+                        stopRecordingButton(recorder)
+                            .transition(.move(edge: .trailing).combined(with: .opacity))
                     }
                 }
                 if let onToggleFacing {
@@ -892,12 +992,12 @@ struct FullscreenSwingView: View {
         if moreOpen {
             popover(top: 64, trailing: 16) {
                 menuRow(
-                    title: "Share",
-                    hint: shareHint,
+                    title: "Download",
+                    hint: downloadHint,
                     disabled: !hasVideo || exporting
                 ) {
                     moreOpen = false
-                    startShare()
+                    startDownload()
                 }
                 if hasVideo, onTrimRange != nil {
                     menuRow(title: "Trim video", hint: "Set the start and the end") {
@@ -945,38 +1045,40 @@ struct FullscreenSwingView: View {
         return "Beta, estimated from impact"
     }
 
-    private var shareHint: String {
-        if !hasVideo { return "No clip to share yet" }
-        if anyOverlayOn { return "Video with your overlays" }
-        return "Video as it was filmed"
+    private var downloadHint: String {
+        if !hasVideo { return "No clip to save yet" }
+        if anyOverlayOn { return "Save to Photos with your overlays" }
+        return "Save to Photos as it was filmed"
     }
 
-    // MARK: - Share
+    // MARK: - Download
 
     /*
-      Export with the overlays burned in, then open the system share sheet.
+      Export with the overlays burned in, then save straight to Photos.
 
-      Three paths, in order of how much work they are:
+      This used to hand the file to the system share sheet. A share sheet is the
+      right control when the destination is unknown, but the destination here is
+      always the same: the golfer wants the clip in their camera roll, and making
+      them pick "Save Video" out of a row of apps every time is a step that only
+      ever has one answer. So it saves, and says whether it worked.
 
-      Nothing switched on means the clip is already what the golfer is looking
-      at, so it goes straight to the sheet with no encode at all.
-
-      Otherwise OverlayExporter redraws every frame with the layers on top. That
+      Two paths, as before. Nothing switched on means the clip is already what
+      the golfer is looking at, so it is copied over with no encode at all.
+      Otherwise OverlayExporter redraws every frame with the layers on top, which
       takes real time on a long or high frame rate clip, so it is modal, it shows
       progress, and it can be cancelled.
 
-      If the encode fails, the clip itself is shared and the golfer still lands
-      on a share sheet. A share that silently does nothing is the bug this
-      replaces, and it would be a poor trade to swap it for a share that fails
-      loudly and gives them nothing.
+      If the encode fails the plain clip is saved rather than nothing, and the
+      toast says which one arrived, so the golfer is never left guessing whether
+      their overlays made it.
     */
     @MainActor
-    private func startShare() {
+    private func startDownload() {
         guard let videoURL else { return }
         playback.pause()
 
         guard anyOverlayOn else {
-            Sharing.present(url: videoURL)
+            Task { await saveToPhotos(videoURL, burned: false, temporary: false) }
             return
         }
 
@@ -999,14 +1101,55 @@ struct FullscreenSwingView: View {
                         exportProgress = value
                     }
                 )
-                Sharing.present(url: url)
+                await saveToPhotos(url, burned: true, temporary: true)
             } catch is CancellationError {
                 // The golfer stopped it. Nothing to say.
             } catch {
-                // Fall back to the clip rather than leaving them with nothing.
-                Sharing.present(url: videoURL)
+                // Fall back to the clip rather than leaving them with nothing,
+                // and say so, because a clip without the overlays is not what
+                // was asked for even though it is better than a failure.
+                await saveToPhotos(videoURL, burned: false, temporary: false)
             }
         }
+    }
+
+    /*
+      Copy a finished file into the photo library.
+
+      Authorisation is requested for addOnly, the narrowest scope there is: the
+      app adds its own clip and never reads the library, so asking for more would
+      be asking for access it has no use for. A refusal is reported rather than
+      swallowed, because a golfer who declined once and forgot needs to be told
+      why nothing arrived instead of tapping Download again.
+
+      `temporary` marks a file this app made for the transfer, which is deleted
+      once Photos has its own copy. The swing's own clip is never deleted, since
+      the app still needs it.
+    */
+    @MainActor
+    private func saveToPhotos(_ url: URL, burned: Bool, temporary: Bool) async {
+        let status = await withCheckedContinuation { (continuation: CheckedContinuation<PHAuthorizationStatus, Never>) in
+            PHPhotoLibrary.requestAuthorization(for: .addOnly) { continuation.resume(returning: $0) }
+        }
+
+        guard status == .authorized || status == .limited else {
+            if temporary { try? FileManager.default.removeItem(at: url) }
+            downloadNotice = "Permission to add to Photos was declined. Turn it on in Settings to save clips."
+            return
+        }
+
+        let saved = await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+            PHPhotoLibrary.shared().performChanges {
+                PHAssetCreationRequest.forAsset().addResource(with: .video, fileURL: url, options: nil)
+            } completionHandler: { success, _ in
+                continuation.resume(returning: success)
+            }
+        }
+
+        if temporary { try? FileManager.default.removeItem(at: url) }
+        downloadNotice = saved
+            ? (burned ? "Saved to Photos with your overlays." : "Saved to Photos.")
+            : "Could not save to Photos."
     }
 
     /*
@@ -1153,6 +1296,145 @@ struct FullscreenSwingView: View {
     }
 
     // MARK: - Building blocks
+
+    /*
+      The draggable divider between the two stages.
+
+      Wider than it looks: the visible bar is a few points of line and a grip, but
+      the gesture target is the full bar height, which is what makes it catchable
+      without aiming. The grip is three dots, the one shape that reads as "drag
+      me" without a label, and the whole bar lights citrus while it is held so the
+      golfer can see which thing their finger has hold of.
+
+      The drag is translation based, taken against the fraction the gesture began
+      at rather than the live one, so a slow drag cannot accumulate rounding drift
+      and creep away from the finger.
+    */
+    private func splitHandle(stageHeight: CGFloat, barHeight: CGFloat) -> some View {
+        let active = splitDragging
+        return ZStack {
+            Rectangle()
+                .fill(active ? Tok.citrus.opacity(0.18) : Color.white.opacity(0.04))
+            VStack(spacing: 0) {
+                Rectangle()
+                    .fill(active ? Tok.citrus : Tok.line)
+                    .frame(height: active ? 2 : 1)
+            }
+            HStack(spacing: 4) {
+                ForEach(0..<3, id: \.self) { _ in
+                    Circle()
+                        .fill(active ? Tok.citrus : Tok.bone3)
+                        .frame(width: 4, height: 4)
+                }
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 5)
+            .background(
+                Capsule().fill(Color.black.opacity(active ? 0.5 : 0.35))
+            )
+        }
+        .frame(height: barHeight)
+        .contentShape(Rectangle())
+        .gesture(
+            DragGesture(minimumDistance: 0)
+                .updating($splitStart) { _, start, _ in
+                    // Latched once per gesture, so every translation is measured
+                    // from where the drag began.
+                    if start == nil { start = splitFraction }
+                }
+                .onChanged { value in
+                    guard stageHeight > 1 else { return }
+                    let base = splitStart ?? splitFraction
+                    let next = base + value.translation.height / stageHeight
+                    splitFraction = min(max(next, Self.splitRange.lowerBound), Self.splitRange.upperBound)
+                    if !splitDragging {
+                        withAnimation(.easeOut(duration: 0.12)) { splitDragging = true }
+                    }
+                }
+                .onEnded { _ in
+                    withAnimation(.easeOut(duration: 0.18)) { splitDragging = false }
+                }
+        )
+        // A double tap puts the split back to even, which is faster than
+        // dragging it back by eye.
+        .onTapGesture(count: 2) {
+            withAnimation(.spring(response: 0.3, dampingFraction: 0.85)) {
+                splitFraction = 0.5
+            }
+        }
+        .accessibilityLabel("Panel divider, drag to resize")
+    }
+
+    /*
+      The record button.
+
+      Red and filled while a take is running, so the state is readable at a glance
+      from across the room rather than from a glyph. It starts a take and does
+      nothing else: while recording it is inert, because stopping belongs to the
+      stop button beside it. A slow pulse marks it as live without the flashing
+      that would fight the video behind it.
+    */
+    @ViewBuilder
+    private func recordButton(_ recorder: ReplayKitManager) -> some View {
+        let live = recorder.isRecording
+        Button {
+            guard !live else { return }
+            recorder.start()
+        } label: {
+            Image(systemName: live ? "record.circle.fill" : "record.circle")
+                .font(.system(size: 19, weight: .regular))
+                .foregroundStyle(live ? Color(red: 1, green: 0.23, blue: 0.19) : Tok.bone)
+                .frame(width: 38, height: 38)
+                .background(
+                    Circle().fill(
+                        live
+                            ? Color(red: 1, green: 0.23, blue: 0.19).opacity(0.18)
+                            : Color.white.opacity(0.06)
+                    )
+                )
+                .overlay {
+                    if live {
+                        Circle().strokeBorder(
+                            Color(red: 1, green: 0.23, blue: 0.19).opacity(0.9),
+                            lineWidth: 1.5
+                        )
+                    }
+                }
+                .opacity(live && recordPulse ? 0.55 : 1)
+        }
+        .buttonStyle(PressScale())
+        .disabled(live)
+        .accessibilityLabel(live ? "Recording" : "Start screen recording")
+        .onChange(of: live) { _, isLive in
+            recordPulse = false
+            guard isLive else { return }
+            withAnimation(.easeInOut(duration: 0.9).repeatForever(autoreverses: true)) {
+                recordPulse = true
+            }
+        }
+    }
+
+    /*
+      Stop, and with it save.
+
+      A square, the one shape every recorder in the world uses for stop, and it
+      exists only while a take is running. stopToURL writes the finished movie and
+      saves it to Photos, so this is the whole of the end of a take: no pause, no
+      confirm, no editor.
+    */
+    private func stopRecordingButton(_ recorder: ReplayKitManager) -> some View {
+        Button {
+            recorder.stopToURL()
+        } label: {
+            RoundedRectangle(cornerRadius: 3, style: .continuous)
+                .fill(Tok.bone)
+                .frame(width: 14, height: 14)
+                .frame(width: 38, height: 38)
+                .background(Circle().fill(Color.white.opacity(0.14)))
+        }
+        .buttonStyle(PressScale())
+        .accessibilityLabel("Stop recording and save to Photos")
+    }
 
     private func iconButton(system: String, active: Bool = false, action: @escaping () -> Void) -> some View {
         Button(action: action) {
@@ -1621,6 +1903,29 @@ struct TrimSheetView: View {
     @State private var thumbs: [UIImage] = []
     @State private var loadedThumbs = false
 
+    /*
+      The zoom preview: the exact frame under whichever handle is being dragged.
+
+      A filmstrip of eight thumbnails is enough to find roughly where the swing
+      is, and useless for deciding whether the cut lands before or after the
+      takeaway. This pulls the real frame at the handle's time and shows it large
+      while the finger is down, so the edit is made against the picture rather
+      than against a decimal.
+    */
+    @State private var previewImage: UIImage?
+    @State private var previewIsStart = true
+    @State private var scrubbing = false
+    // Serialised so a fast drag cannot leave a stale frame on screen: each new
+    // request cancels the one before it.
+    @State private var previewTask: Task<Void, Never>?
+    // Reused across the whole drag rather than rebuilt per frame, which is what
+    // keeps the preview up with the finger.
+    @State private var previewGenerator: AVAssetImageGenerator?
+    // The last whole tenth of a second a tick fired at, so the haptics mark real
+    // movement instead of firing on every pixel of travel.
+    @State private var lastHapticStep: Int?
+    @State private var haptics = UISelectionFeedbackGenerator()
+
     // Nothing shorter than this can be selected, so a fumbled drag cannot
     // produce a clip with no frames in it.
     private let minimumSpan: Double = 0.2
@@ -1633,6 +1938,7 @@ struct TrimSheetView: View {
     var body: some View {
         VStack(spacing: Tok.s4) {
             header
+            zoomPreview
             strip
             Spacer(minLength: 0)
             footer
@@ -1642,7 +1948,15 @@ struct TrimSheetView: View {
         .background(Tok.turf900.ignoresSafeArea())
         .task {
             if end <= 0 { end = duration }
+            // The frame the trimmed clip will open on, so the preview is useful
+            // before anything has been dragged.
+            updatePreview(seconds: start, isStart: true)
             await loadThumbnails()
+        }
+        .onDisappear {
+            previewTask?.cancel()
+            previewTask = nil
+            previewGenerator = nil
         }
     }
 
@@ -1660,6 +1974,95 @@ struct TrimSheetView: View {
         }
         .frame(maxWidth: .infinity)
         .padding(.top, Tok.s2)
+    }
+
+    /*
+      The frame under the handle, shown large.
+
+      Always present, so the sheet does not jump in height the instant a finger
+      lands on a handle. It holds the start frame at rest, which is the frame the
+      trimmed clip will open on, and swaps to whichever end is being dragged
+      while a drag is running. The caption names which end is being looked at,
+      because two ends that look alike on a range clip are otherwise impossible
+      to tell apart.
+    */
+    private var zoomPreview: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: Tok.rMd, style: .continuous)
+                .fill(Tok.turf800)
+
+            if let previewImage {
+                Image(uiImage: previewImage)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .clipShape(RoundedRectangle(cornerRadius: Tok.rMd, style: .continuous))
+            } else {
+                Text("Drag a handle to preview")
+                    .font(.body(TypeScale.micro))
+                    .foregroundStyle(Tok.bone3)
+            }
+        }
+        .frame(height: 210)
+        .overlay {
+            RoundedRectangle(cornerRadius: Tok.rMd, style: .continuous)
+                .strokeBorder(scrubbing ? Tok.citrus : Tok.line, lineWidth: scrubbing ? 2 : 1)
+        }
+        .overlay(alignment: .bottom) {
+            Text("\(previewIsStart ? "Start" : "End")  \(clock(previewIsStart ? start : end))")
+                .font(.data(TypeScale.nano))
+                .foregroundStyle(Tok.bone)
+                .monospacedDigit()
+                .padding(.vertical, 5)
+                .padding(.horizontal, 12)
+                .background(Capsule().fill(Color.black.opacity(0.7)))
+                .padding(.bottom, 8)
+        }
+        .animation(.easeOut(duration: 0.15), value: scrubbing)
+    }
+
+    /*
+      Pull one frame for the preview.
+
+      Zero tolerance both ways, unlike the filmstrip: this is the frame the cut
+      actually lands on, so an image from a quarter second away would be a
+      picture of a different moment being used to make the decision. The
+      generator is built once per sheet and kept, because rebuilding it per frame
+      is what makes a scrub stutter.
+    */
+    private func updatePreview(seconds: Double, isStart: Bool) {
+        previewIsStart = isStart
+        guard let videoURL else { return }
+
+        if previewGenerator == nil {
+            let generator = AVAssetImageGenerator(asset: AVURLAsset(url: videoURL))
+            generator.appliesPreferredTrackTransform = true
+            generator.maximumSize = CGSize(width: 720, height: 720)
+            generator.requestedTimeToleranceBefore = .zero
+            generator.requestedTimeToleranceAfter = .zero
+            previewGenerator = generator
+        }
+        guard let generator = previewGenerator else { return }
+
+        previewTask?.cancel()
+        previewTask = Task { @MainActor in
+            let time = CMTime(seconds: max(0, seconds), preferredTimescale: 600)
+            guard let cg = try? await generator.image(at: time).image else { return }
+            guard !Task.isCancelled else { return }
+            previewImage = UIImage(cgImage: cg)
+        }
+    }
+
+    /*
+      One tick per tenth of a second crossed, the cadence the system camera's own
+      scrubber uses. Firing on every gesture callback would be a continuous buzz
+      rather than feedback, and firing per frame would be worse on a 240 fps clip,
+      so the tick is tied to the time being selected instead of to the finger.
+    */
+    private func hapticStep(_ seconds: Double) {
+        let step = Int((seconds * 10).rounded())
+        guard step != lastHapticStep else { return }
+        lastHapticStep = step
+        haptics.selectionChanged()
     }
 
     private var strip: some View {
@@ -1730,12 +2133,27 @@ struct TrimSheetView: View {
             .gesture(
                 DragGesture(minimumDistance: 0, coordinateSpace: .named("trimStrip"))
                     .onChanged { value in
+                        if !scrubbing {
+                            scrubbing = true
+                            // Warm the Taptic Engine so the first tick lands with
+                            // the finger rather than a beat behind it.
+                            haptics.prepare()
+                        }
                         let seconds = time(atX: value.location.x, in: width)
+                        let landed: Double
                         if isStart {
                             start = min(max(0, seconds), max(0, end - minimumSpan))
+                            landed = start
                         } else {
                             end = max(min(duration, seconds), min(duration, start + minimumSpan))
+                            landed = end
                         }
+                        hapticStep(landed)
+                        updatePreview(seconds: landed, isStart: isStart)
+                    }
+                    .onEnded { _ in
+                        scrubbing = false
+                        lastHapticStep = nil
                     }
             )
             .accessibilityLabel(isStart ? "Trim start" : "Trim end")

@@ -701,6 +701,9 @@ public final class HumanoidRig {
     private var style: JointColorStyle
 
     private var segments: [SegmentID: SCNNode] = [:]
+    /* Segments switched off per joint by the golfer. Consulted by every show
+       path, so a suppressed segment survives the per frame visibility rebuild. */
+    private var suppressed: Set<SegmentID> = []
     private var markers: [MarkerID: SCNNode] = [:]
     private var markerMaterials: [MarkerID: SCNMaterial] = [:]
 
@@ -922,6 +925,67 @@ public final class HumanoidRig {
         applyMarkerColours()
     }
 
+    /*
+      Show or hide every body segment in one move, so the 3D figure honours the
+      "Show connecting lines" switch the same way the 2D overlay does. The joint
+      markers live on a separate node and are left untouched, so hiding the body
+      leaves a clean dot skeleton.
+
+      This flips the shared bodyNode, the parent of every segment, rather than the
+      segments themselves. That is deliberate: apply() toggles each segment's own
+      isHidden every frame from the confidence test, and a child is drawn only
+      when neither it nor bodyNode is hidden, so setting it on the parent survives
+      the per frame updates instead of being overwritten by the next one.
+    */
+    public func setConnectingLinesVisible(_ visible: Bool) {
+        bodyNode.isHidden = !visible
+    }
+
+    /*
+      Hide the body segments belonging to a set of joints.
+
+      The 2D overlay lets a golfer switch off the lines at one joint and keep the
+      rest; this is the same switch for the 3D figure. Each joint owns the
+      segments that hang off it (a shoulder owns its cap and its upper arm, a knee
+      its cap and its shin), so switching the left knee off drops the left shin
+      and leaves the thigh above it, which is the limb the golfer chose to keep.
+
+      Stored as a suppressed set rather than applied once, because apply() rebuilds
+      every segment's visibility from the confidence test on each frame. The show
+      paths consult this set, so a suppressed segment stays hidden across frames
+      instead of reappearing on the next one.
+    */
+    func setHiddenLineJoints(_ joints: Set<JointKey>) {
+        let ids = Set(joints.flatMap { Self.segments(ownedBy: $0) })
+        guard ids != suppressed else { return }
+        suppressed = ids
+        for id in Self.allSegmentIDs where suppressed.contains(id) {
+            segments[id]?.isHidden = true
+        }
+    }
+
+    /*
+      Which segments each joint governs.
+
+      A joint owns the cap sitting on it and the segment running distally from it,
+      so every segment has exactly one owner and no segment is left ungoverned.
+      The hand and foot blocks hang off the wrist and the ankle for the same
+      reason the 2D triangle does.
+    */
+    private static func segments(ownedBy joint: JointKey) -> [SegmentID] {
+        let left = joint.isLeft
+        switch joint {
+        case .leftShoulder, .rightShoulder: return [.shoulderCap(left), .upperArm(left)]
+        case .leftElbow, .rightElbow: return [.elbowCap(left), .forearm(left)]
+        case .leftWrist, .rightWrist: return [.hand(left)]
+        case .leftHip, .rightHip: return [.thigh(left)]
+        case .leftKnee, .rightKnee: return [.kneeCap(left), .shin(left)]
+        case .leftAnkle, .rightAnkle: return [.foot(left)]
+        }
+    }
+
+    private static let allSegmentIDs: [SegmentID] = JointKey.allCases.flatMap { segments(ownedBy: $0) }
+
     public var jointColorStyle: JointColorStyle { style }
 
     private func applyMarkerColours() {
@@ -1098,7 +1162,10 @@ public final class HumanoidRig {
             hide(id)
             return
         }
-        guard let node = segments[id] else { return }
+        guard let node = segments[id], !suppressed.contains(id) else {
+            hide(id)
+            return
+        }
         var m = result.matrix
         if lengthGain != 1 {
             /* Column 1 is the local y axis, which already carries the length, so
@@ -1110,7 +1177,7 @@ public final class HumanoidRig {
     }
 
     private func cap(_ id: SegmentID, at point: PosePoint) {
-        guard point.ok, let node = segments[id] else {
+        guard point.ok, !suppressed.contains(id), let node = segments[id] else {
             hide(id)
             return
         }
@@ -1120,7 +1187,7 @@ public final class HumanoidRig {
     }
 
     private func setTransform(_ id: SegmentID, _ matrix: simd_float4x4?) {
-        guard let matrix, let node = segments[id] else {
+        guard let matrix, !suppressed.contains(id), let node = segments[id] else {
             hide(id)
             return
         }

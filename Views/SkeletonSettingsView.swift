@@ -26,6 +26,10 @@ struct SkeletonSettingsView: View {
     @State private var expanded: Set<JointKey> = []
     // The angle style panel, opened by the gear on either angle row.
     @State private var angleStyleOpen = false
+    // The joint whose summary rides in the header. Set to the last joint the
+    // golfer opened, cleared when that same joint is closed, so the header always
+    // names the row being worked on rather than guessing from an unordered set.
+    @State private var activeJoint: JointKey?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -33,6 +37,7 @@ struct SkeletonSettingsView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: Tok.s5) {
                     sliders
+                    linesToggle
                     colourMode
                     jointsSection
                 }
@@ -49,14 +54,34 @@ struct SkeletonSettingsView: View {
 
     private var header: some View {
         ZStack {
-            Text("Skeleton")
-                .font(.serif(TypeScale.head))
-                .foregroundStyle(Tok.bone)
+            /*
+              Title, with the open joint's live status underneath it. The status
+              line names the joint and every toggle currently on, e.g.
+              "Left shoulder · tracked · inner · outer", so the header always
+              reflects the row being edited. It is held to one line and allowed to
+              shrink rather than push the buttons around, which is the overflow the
+              old fixed title could not handle.
+            */
+            VStack(spacing: 2) {
+                Text("Skeleton")
+                    .font(.serif(TypeScale.head))
+                    .foregroundStyle(Tok.bone)
+                if let summary = activeJointSummary {
+                    Text(summary)
+                        .font(.data(TypeScale.nano))
+                        .foregroundStyle(Tok.bone3)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.5)
+                        .frame(maxWidth: 190)
+                        .transition(.opacity)
+                }
+            }
 
             HStack {
                 Button("Reset all") {
                     settings.resetAll()
                     expanded = []
+                    activeJoint = nil
                 }
                 .font(.body(TypeScale.small))
                 .foregroundStyle(Tok.bone2)
@@ -70,6 +95,73 @@ struct SkeletonSettingsView: View {
         }
         .padding(.horizontal, Tok.s4)
         .padding(.vertical, Tok.s4)
+    }
+
+    /*
+      The header status line for the open joint, or nil when no joint is open.
+
+      Built from the real JointSetting fields: `track`, `innerAngle`, `outerAngle`
+      (the brief calls the first "tracked", but the stored property is `track`, so
+      that is what is read here and the word "tracked" is shown for it). Reads
+      straight off the settings model, so flipping a toggle updates the header at
+      once. Returns just the joint name when nothing is on.
+    */
+    private var activeJointSummary: String? {
+        guard let joint = activeJoint else { return nil }
+        let s = settings.setting(for: joint)
+        var parts: [String] = []
+        if s.track { parts.append("tracked") }
+        if s.innerAngle { parts.append("inner") }
+        if s.outerAngle { parts.append("outer") }
+        return ([joint.label] + parts).joined(separator: " \u{00b7} ")
+    }
+
+    /*
+      The status suffix for a joint row, or nil when nothing is on.
+
+      Same wording as the header line but without the joint name, since the row
+      already carries it: "tracked \u{00b7} inner \u{00b7} outer". Reads the real
+      JointSetting fields (`track`, `innerAngle`, `outerAngle`, `showLine`), so it
+      updates the instant a toggle flips. A joint whose lines are hidden says so,
+      because that is a change to the drawing a golfer will otherwise hunt for.
+    */
+    private func jointStatusText(_ joint: JointKey) -> String? {
+        let s = settings.setting(for: joint)
+        var parts: [String] = []
+        if s.track { parts.append("tracked") }
+        if s.innerAngle { parts.append("inner") }
+        if s.outerAngle { parts.append("outer") }
+        if !s.showLine { parts.append("no line") }
+        return parts.isEmpty ? nil : parts.joined(separator: " \u{00b7} ")
+    }
+
+    // MARK: Connecting lines
+
+    /*
+      One switch for the bones. Off leaves the joint dots and their angle readouts
+      but drops the connecting lines, so a golfer can read joint positions without
+      the figure's limbs drawn over the video. Wired straight to the settings
+      model, which persists it and pushes it live to both the 2D overlay and the
+      3D rig.
+    */
+    private var linesToggle: some View {
+        Toggle(isOn: $settings.showConnectingLines) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Show connecting lines")
+                    .font(.body(TypeScale.body))
+                    .foregroundStyle(Tok.bone)
+                Text("Off leaves only the joint dots")
+                    .font(.body(TypeScale.micro))
+                    .foregroundStyle(Tok.bone3)
+            }
+        }
+        .tint(Tok.citrus)
+        .padding(Tok.s3)
+        .background(RoundedRectangle(cornerRadius: Tok.rMd, style: .continuous).fill(Tok.turf800.opacity(0.6)))
+        .overlay {
+            RoundedRectangle(cornerRadius: Tok.rMd, style: .continuous)
+                .strokeBorder(Tok.line, lineWidth: 1)
+        }
     }
 
     // MARK: Sliders
@@ -243,14 +335,39 @@ struct SkeletonSettingsView: View {
         return VStack(spacing: Tok.s2) {
             Button {
                 withAnimation(.easeInOut(duration: 0.16)) {
-                    if isOpen { expanded.remove(joint) } else { expanded.insert(joint) }
+                    if isOpen {
+                        expanded.remove(joint)
+                        // Closing the joint that owns the header line clears it.
+                        if activeJoint == joint { activeJoint = nil }
+                    } else {
+                        expanded.insert(joint)
+                        // Opening a joint hands it the header status line.
+                        activeJoint = joint
+                    }
                 }
             } label: {
-                HStack {
+                HStack(spacing: Tok.s2) {
                     Text(joint.label)
                         .font(.body(TypeScale.body))
                         .foregroundStyle(Tok.bone)
-                    Spacer()
+                        .layoutPriority(1)
+                    Spacer(minLength: Tok.s2)
+                    /*
+                      The joint's live status, on the same line as its name and
+                      visible whether the row is open or shut. That is the whole
+                      point: a golfer scanning the list sees which joints are
+                      tracked and which are printing angles without opening twelve
+                      rows one at a time. Dimmer and smaller than the name so the
+                      name still leads, and allowed to shrink rather than push the
+                      chevron off the row.
+                    */
+                    if let status = jointStatusText(joint) {
+                        Text(status)
+                            .font(.body(TypeScale.micro))
+                            .foregroundStyle(Tok.bone3)
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.7)
+                    }
                     Image(systemName: isOpen ? "chevron.up" : "chevron.down")
                         .font(.system(size: 9, weight: .semibold))
                         .foregroundStyle(Tok.bone3)
@@ -283,6 +400,23 @@ struct SkeletonSettingsView: View {
                     hint: nil,
                     isOn: binding.outerAngle,
                     showsStyleGear: true
+                )
+                /*
+                  The per joint line switch, last in the row's stack because it
+                  governs the drawing rather than a readout. Kept as a fourth
+                  toggleRow rather than a separate icon button so it reads and
+                  behaves exactly like the three above it: same hit area, same
+                  On/Off word, nothing new to learn. The global "Show connecting
+                  lines" switch at the top of the sheet still wins when it is off,
+                  which the hint says outright so a golfer is never left wondering
+                  why this one did nothing.
+                */
+                toggleRow(
+                    title: "Show connecting line",
+                    hint: settings.showConnectingLines
+                        ? "Draws the bones meeting at this joint"
+                        : "Turn on Show connecting lines above first",
+                    isOn: binding.showLine
                 )
 
                 if angleStyleOpen {

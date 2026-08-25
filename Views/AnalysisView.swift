@@ -319,7 +319,7 @@ struct AnalysisView: View {
     @State private var drillSheetOpen = false
     // Overlay layer toggles, driving what the inline viewport draws.
     @State private var showSkeletonLayer = true
-    @State private var showHandPath = true
+    @State private var showHandPath = false
     @State private var showClubPath = false
     @State private var showBallFlight = false
     @State private var showSpineLine = true
@@ -445,18 +445,6 @@ struct AnalysisView: View {
                 PlaybackControls(playback: playback, phaseMarks: phaseMarks)
             }
 
-            if let metricSource {
-                measurementBadge
-                metricsHeader
-                MetricsBar(
-                    source: metricSource,
-                    frameIndex: playback.frameIndex,
-                    selected: selectedMetrics.wrappedValue,
-                    layout: .grid
-                )
-                .padding(.bottom, Tok.s3)
-            }
-
             Text(headline)
                 .font(.serif(TypeScale.title))
                 .foregroundStyle(Tok.bone)
@@ -479,6 +467,28 @@ struct AnalysisView: View {
 
             fullBreakdownSection
             diagnosticReportSection
+
+            /*
+              The metrics, at the foot of the page.
+
+              They used to sit directly under the transport, between the video and
+              the headline, where they pushed the diagnosis and the category rows
+              off the first screen and took the space a golfer wants for the
+              picture. Down here the clip and its verdict lead, and the numbers are
+              where somebody who wants to read them goes looking, rather than
+              something everybody has to scroll past.
+            */
+            if let metricSource {
+                measurementBadge
+                metricsHeader
+                MetricsBar(
+                    source: metricSource,
+                    frameIndex: playback.frameIndex,
+                    selected: selectedMetrics.wrappedValue,
+                    layout: .grid
+                )
+                .padding(.bottom, Tok.s3)
+            }
 
             HStack(spacing: Tok.s3) {
                 Button {
@@ -714,6 +724,8 @@ struct AnalysisView: View {
                 markerPalette: .standard,
                 showTraces: settings3D.showTraces,
                 showGrid: settings3D.showGrid,
+                showConnectingLines: skeleton.showConnectingLines,
+                hiddenLineJoints: skeleton.hiddenLineJoints,
                 controls: controls3D,
                 isUnlocked: settings3D.isUnlocked
             )
@@ -1852,14 +1864,22 @@ struct AnalysisView: View {
                 .buttonStyle(PressScale())
 
                 if diagnosticOpen {
-                    if let measured = swing.validity?.measured {
-                        measuredCard(measured)
-                    }
+                    /*
+                      Coaching positions first, then what the camera could and
+                      could not read.
+
+                      That order matches how the report is used: the positions say
+                      where in the swing the engine landed, and the measured card
+                      then qualifies every number above it. The raw diagnostic data
+                      card that used to sit last is gone; it printed the fault id
+                      and a fault count, which are engine internals a golfer has no
+                      use for and which the headline already says in plain words.
+                    */
                     if let phases = swing.phases {
                         coachingPositionsCard(phases)
                     }
-                    if let diagnosis = swing.diagnosis {
-                        diagnosisDataCard(diagnosis)
+                    if let measured = swing.validity?.measured {
+                        measuredCard(measured)
                     }
                 }
             }
@@ -1928,40 +1948,6 @@ struct AnalysisView: View {
             }
         }
         .card()
-    }
-
-    private func diagnosisDataCard(_ diagnosis: DiagnosisResult) -> some View {
-        VStack(alignment: .leading, spacing: Tok.s2) {
-            Text("DIAGNOSTIC DATA")
-                .font(.data(TypeScale.nano))
-                .tracking(1.5)
-                .foregroundStyle(Tok.bone3)
-                .padding(.bottom, 2)
-
-            dataRow("headline", diagnosis.headline)
-            if let category = diagnosis.category {
-                dataRow("category", category.rawValue)
-            }
-            if let faultId = diagnosis.faultId {
-                dataRow("faultId", faultId)
-            }
-            dataRow("faults", "\(diagnosis.faults.count)")
-        }
-        .card()
-    }
-
-    private func dataRow(_ key: String, _ value: String) -> some View {
-        HStack(alignment: .top, spacing: Tok.s3) {
-            Text(key)
-                .font(.data(TypeScale.nano))
-                .foregroundStyle(Tok.bone3)
-                .frame(width: 74, alignment: .leading)
-            Text(value)
-                .font(.data(TypeScale.nano))
-                .foregroundStyle(Tok.bone)
-                .fixedSize(horizontal: false, vertical: true)
-            Spacer(minLength: 0)
-        }
     }
 
     // MARK: Breakdown lookups
